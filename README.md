@@ -8,8 +8,9 @@ validated triage results using an LLM and deterministic business rules.
 TASK-001 initializes the repository: Python packaging, dependencies, development
 tools, an importable `app` package, and an environment-variable template.
 TASK-002 adds domain enums and validated request, classification, and response
-schemas with automated tests. API endpoints, LLM integration, evaluation, Docker,
-and CI are scheduled for later tasks and are not implemented yet.
+schemas with automated tests. TASK-003 adds the health and triage endpoints with
+a deterministic mock response and Swagger documentation. LLM integration,
+business rules, evaluation, Docker, and CI are scheduled for later tasks.
 
 See [the project plan](docs/PROJECT_PLAN.md) for the specification and roadmap,
 and [AGENTS.md](AGENTS.md) for development guidelines.
@@ -44,6 +45,52 @@ python3 -m venv .venv
 .venv/bin/python -c "import app; print('Project imports successfully')"
 ```
 
+## Running locally
+
+Start the application from the repository root:
+
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload
+```
+
+On macOS / Linux, use `.venv/bin/python -m uvicorn app.main:app --reload`.
+Open [Swagger UI](http://localhost:8000/docs) to try the endpoints. The OpenAPI
+schema is available at [openapi.json](http://localhost:8000/openapi.json).
+
+## API usage (temporary mock)
+
+`GET /health` returns HTTP 200 with `{"status": "ok"}`.
+
+`POST /api/v1/triage` accepts a JSON ticket and returns HTTP 200 after validation.
+For example, submit this body through Swagger UI:
+
+```json
+{
+  "ticket_id": "TCK-1001",
+  "subject": "VPN connection problem",
+  "description": "I cannot connect to the corporate VPN after changing my password."
+}
+```
+
+Response:
+
+```json
+{
+  "ticket_id": "TCK-1001",
+  "category": "other",
+  "department": "service_desk",
+  "priority": "medium",
+  "summary": "Mock triage result; ticket has not been classified.",
+  "suggested_action": "Review the ticket manually.",
+  "needs_human_review": true
+}
+```
+
+Every valid ticket receives the same mock values except for its validated
+`ticket_id`, which is `null` when omitted. Ticket content is not classified yet.
+Invalid requests return HTTP 422. The endpoint uses `TicketRequest` and
+`TriageResponse` for request and response validation. No API key is required.
+
 ## Environment variables
 
 `.env.example` contains placeholders for the planned provider configuration:
@@ -73,7 +120,9 @@ Using the virtual environment's Python (Windows commands shown):
 On macOS / Linux, use `.venv/bin/python` instead.
 
 Schema tests cover field requirements, length boundaries, enum values, invalid
-input, and JSON serialization. They run without API keys or real LLM calls.
+input, and JSON serialization. API tests cover health, mock triage responses,
+request and response validation, Swagger, and OpenAPI. Tests run without API keys
+or real LLM calls.
 
 ## Domain models and validation
 
@@ -99,9 +148,11 @@ only validate the supplied fields.
 app/
     __init__.py
     enums.py
+    main.py
     schemas.py
 tests/
     .gitkeep
+    test_api.py
     test_schemas.py
 docs/
     PROJECT_PLAN.md
