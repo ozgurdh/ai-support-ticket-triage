@@ -388,7 +388,11 @@ def test_configuration_failure_makes_no_request(
     ],
 )
 def test_exhausted_provider_failure_reaches_http_response(
-    provider: Mock, failure: httpx.Response | Exception, status: int, detail: str
+    provider: Mock,
+    failure: httpx.Response | Exception,
+    status: int,
+    detail: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     provider.side_effect = [failure, failure]
     with TestClient(main.app) as client:
@@ -397,10 +401,22 @@ def test_exhausted_provider_failure_reaches_http_response(
     assert response.status_code == status
     assert response.json() == {"detail": detail}
     assert provider.call_count == 2
+    logs = [record for record in caplog.records if record.name == "app.requests"]
+    assert len(logs) == 1  # Retries belong to the same HTTP request.
+    metadata = json.loads(logs[0].getMessage())
+    assert metadata["request_id"] == response.headers["X-Request-ID"]
+    assert metadata["model"] == "test-model"
+    assert metadata["status_code"] == status
+    assert metadata["error_type"] is not None
+    assert "Private" not in logs[0].getMessage()
+    assert "test-only-key" not in logs[0].getMessage()
 
 
 def test_missing_configuration_returns_safe_500_without_provider_call(
-    monkeypatch: pytest.MonkeyPatch, provider: Mock, sdk_factory: Mock
+    monkeypatch: pytest.MonkeyPatch,
+    provider: Mock,
+    sdk_factory: Mock,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     monkeypatch.delenv("OPENAI_API_KEY")
     with TestClient(main.app, raise_server_exceptions=False) as client:
@@ -410,3 +426,33 @@ def test_missing_configuration_returns_safe_500_without_provider_call(
     assert response.json() == {"detail": "Internal server error."}
     provider.assert_not_called()
     sdk_factory.assert_not_called()
+    logs = [record for record in caplog.records if record.name == "app.requests"]
+    assert len(logs) == 1
+    metadata = json.loads(logs[0].getMessage())
+    assert metadata["request_id"] == response.headers["X-Request-ID"]
+    assert metadata["model"] is None
+    assert metadata["error_type"] == "ValidationError"
+    assert metadata["status_code"] == 500
+
+
+def test_success_log_uses_model_loaded_by_client(
+    provider: Mock, caplog: pytest.LogCaptureFixture
+) -> None:
+    with TestClient(main.app) as client:
+        response = client.post("/api/v1/triage", json=TICKET.model_dump())
+
+    assert response.status_code == 200
+    provider.assert_called_once()
+    logs = [record for record in caplog.records if record.name == "app.requests"]
+    assert len(logs) == 1
+    metadata = json.loads(logs[0].getMessage())
+    assert metadata["model"] == "test-model"
+    assert metadata["request_id"] == response.headers["X-Request-ID"]
+    assert metadata["error_type"] is None
+    for sensitive in (
+        TICKET.subject,
+        TICKET.description,
+        TICKET.ticket_id,
+        "test-only-key",
+    ):
+        assert sensitive not in logs[0].getMessage()

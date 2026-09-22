@@ -15,7 +15,8 @@ TASK-005 adds a standalone OpenAI client with structured classification, validat
 environment settings, and timeout/error foundations. TASK-006 connects the API to
 the LLM client through a service that derives department routing and human review.
 TASK-007 adds bounded retries for transient provider failures and safe HTTP error
-responses. Request logging, evaluation, Docker, and CI are scheduled for later tasks.
+responses. TASK-008 adds request logging and correlation IDs. Evaluation, Docker,
+and CI are scheduled for later tasks.
 
 See [the project plan](docs/PROJECT_PLAN.md) for the specification and roadmap,
 and [AGENTS.md](AGENTS.md) for development guidelines.
@@ -108,6 +109,29 @@ Failures return the following HTTP responses after any eligible retry:
 
 Provider and server error responses do not expose exception details or model output.
 
+## Request logging
+
+Every response includes `X-Request-ID`, including validation and server errors.
+Clients may supply this header to correlate requests: accepted IDs contain 1–64
+ASCII letters, digits, dots, underscores, or hyphens. Missing or invalid IDs are
+replaced with a generated UUID. IDs should contain only correlation identifiers.
+
+The `app.requests` logger writes one JSON record to stderr for each HTTP request,
+using Python's standard logging module. It includes `request_id`, `endpoint`,
+`status_code`, `latency_ms`, `model`, and `error_type`. Successful and client-error
+requests use INFO; server/provider errors use ERROR. Latency uses a monotonic
+clock and measures processing until the response is ready, including retries.
+The model is recorded from the LLM client's validated settings; it is `null` for
+requests that never reach that point, such as health checks or invalid input.
+Error types are exception class names; successful requests have `null`.
+
+Request logs exclude ticket IDs, subjects, descriptions, generated classifications,
+authorization headers, API keys, and exception messages/tracebacks. Endpoint
+values use route templates without query strings; unmatched paths are recorded
+as `<unmatched>`. Logging metadata is isolated per request, including concurrent
+requests handled by synchronous workers. These records are separate from the
+web server's own access/error logs and any explicitly enabled dependency debug logs.
+
 ## Environment variables
 
 `app/config.py` loads the following variables from the environment or a local
@@ -151,6 +175,9 @@ the SDK against an in-memory HTTP mock, including structured-output validation,
 timeouts, provider errors, refusals, and incomplete responses. Retry tests cover
 recovery, the two-attempt limit, non-retryable failures, and propagation to HTTP
 responses. Retry delays are mocked so tests do not sleep.
+Logging tests cover correlation IDs, latency, safe error metadata, sensitive-data
+exclusion, and isolation between concurrent requests. SDK tests verify that the
+actual configured model appears in request logs without exposing API keys.
 
 ## Domain models and validation
 
@@ -259,6 +286,7 @@ app/
     llm_client.py
     main.py
     prompt.py
+    request_logging.py
     schemas.py
     service.py
 tests/
@@ -267,6 +295,7 @@ tests/
     test_config.py
     test_llm_client.py
     test_prompt.py
+    test_request_logging.py
     test_schemas.py
     test_service.py
 docs/

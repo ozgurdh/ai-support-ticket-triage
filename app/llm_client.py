@@ -17,6 +17,7 @@ from tenacity import Retrying, retry_if_exception, stop_after_attempt, wait_fixe
 
 from app.config import Settings
 from app.prompt import build_messages
+from app.request_logging import record_model
 from app.schemas import LLMClassificationResult, TicketRequest
 
 
@@ -105,6 +106,7 @@ def classify_ticket(
     """Classify a validated ticket; configuration errors remain local errors."""
     if settings is None:
         settings = Settings()
+    record_model(settings.openai_model)
     messages = cast(ResponseInputParam, build_messages(ticket))
 
     try:
