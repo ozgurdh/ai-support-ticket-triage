@@ -11,8 +11,9 @@ TASK-002 adds domain enums and validated request, classification, and response
 schemas with automated tests. TASK-003 adds the health and triage endpoints with
 a deterministic mock response and Swagger documentation. TASK-004 adds the prompt
 builder, taxonomy descriptions, priority rubric, and input trust instructions.
-LLM integration, business rules, evaluation, Docker, and CI are scheduled for
-later tasks.
+TASK-005 adds a standalone OpenAI client with structured classification, validated
+environment settings, and timeout/error foundations. API integration and business
+rules, retries, evaluation, Docker, and CI are scheduled for later tasks.
 
 See [the project plan](docs/PROJECT_PLAN.md) for the specification and roadmap,
 and [AGENTS.md](AGENTS.md) for development guidelines.
@@ -95,18 +96,20 @@ Invalid requests return HTTP 422. The endpoint uses `TicketRequest` and
 
 ## Environment variables
 
-`.env.example` contains placeholders for the planned provider configuration:
+`app/config.py` loads the following variables from the environment or a local
+`.env` file. Environment variables take precedence over `.env` values.
 
 | Variable | Purpose |
 | --- | --- |
-| `OPENAI_API_KEY` | Provider API key; blank in the template. |
-| `OPENAI_MODEL` | Model name; blank in the template. |
-| `OPENAI_TIMEOUT_SECONDS` | Planned provider timeout; template value is 30 seconds. |
+| `OPENAI_API_KEY` | Required, nonblank provider API key; blank in the template. |
+| `OPENAI_MODEL` | Required model supporting Responses API structured outputs; blank in the template. |
+| `OPENAI_TIMEOUT_SECONDS` | Positive, finite SDK timeout in seconds; defaults to 30. |
 
-No API key is needed for repository setup or import checks. Environment loading
-and provider calls are not implemented yet. When integration is added, copy
-`.env.example` to `.env` and set local values. `.env` and local virtual
-environments are ignored by Git; never commit credentials.
+To use the LLM client, copy `.env.example` to `.env` and set the key and model.
+Settings are loaded when the client is called, so imports, the current mock API,
+and tests do not require credentials. API keys use Pydantic `SecretStr` to mask
+their normal representation. `.env` and local virtual environments are ignored
+by Git; never commit credentials.
 
 ## Development checks
 
@@ -127,6 +130,9 @@ request and response validation, Swagger, and OpenAPI. Prompt tests cover taxono
 and rubric coverage, output instructions, ticket formatting, and separation of
 ticket content from system instructions. Tests run without API keys or real LLM
 calls; they do not measure model accuracy or resistance to prompt injection.
+Settings tests isolate environment and dotenv values. LLM client tests exercise
+the SDK against an in-memory HTTP mock, including structured-output validation,
+timeouts, provider errors, refusals, and incomplete responses.
 
 ## Domain models and validation
 
@@ -158,22 +164,59 @@ project plan's definitions. It requests only the four classification fields,
 requires factual summaries and a safe initial action, and instructs the model to
 treat ticket text as untrusted data and ignore embedded instructions.
 
-The prompt builder is not connected to the API yet. The triage endpoint continues
-to return its temporary mock response. Provider calls and structured-output
-integration belong to TASK-005.
+The LLM client uses this builder. The triage endpoint continues to return its
+temporary mock response until the service integration task.
+
+## LLM client
+
+`app.llm_client.classify_ticket(ticket, settings=None)` accepts a validated
+`TicketRequest` and returns `LLMClassificationResult`. It uses the OpenAI
+Responses API's `responses.parse` method with the existing Pydantic schema,
+following the [Structured Outputs guide](https://developers.openai.com/api/docs/guides/structured-outputs).
+The SDK dependency now requires version 2.54 or later within major version 2,
+the baseline tested for this integration.
+
+The following explicitly invokes the real provider after configuring `.env`:
+
+```python
+from app.llm_client import classify_ticket
+from app.schemas import TicketRequest
+
+ticket = TicketRequest(
+    subject="VPN connection problem",
+    description="I cannot connect to the corporate VPN after changing my password.",
+)
+result = classify_ticket(ticket)
+```
+
+An optional `Settings` instance can supply configuration explicitly. The client
+requests `store=False` and closes its SDK connection after each call. Each call
+makes one attempt, with SDK retries disabled. The configured timeout applies to
+SDK network operations; it is not an overall application deadline.
+
+`LLMTimeoutError` identifies timeouts, `LLMResponseError` identifies invalid,
+missing, refused, or incomplete classifications, and `LLMClientError` handles
+other provider failures. These errors use generic messages without provider
+payloads. Missing or invalid settings raise local Pydantic validation errors
+before any provider request. Routing, human-review decisions, HTTP error mapping,
+and retry policies are not implemented in this client.
 
 ## Repository structure
 
 ```text
 app/
     __init__.py
+    config.py
     enums.py
+    llm_client.py
     main.py
     prompt.py
     schemas.py
 tests/
     .gitkeep
     test_api.py
+    test_config.py
+    test_llm_client.py
     test_prompt.py
     test_schemas.py
 docs/
