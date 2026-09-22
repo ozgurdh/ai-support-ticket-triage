@@ -15,8 +15,9 @@ TASK-005 adds a standalone OpenAI client with structured classification, validat
 environment settings, and timeout/error foundations. TASK-006 connects the API to
 the LLM client through a service that derives department routing and human review.
 TASK-007 adds bounded retries for transient provider failures and safe HTTP error
-responses. TASK-008 adds request logging and correlation IDs. Evaluation, Docker,
-and CI are scheduled for later tasks.
+responses. TASK-008 adds request logging and correlation IDs. TASK-009 completes
+the automated behavioral test suite, including provider and logging failure paths.
+Evaluation, Docker, and CI are scheduled for later tasks.
 
 See [the project plan](docs/PROJECT_PLAN.md) for the specification and roadmap,
 and [AGENTS.md](AGENTS.md) for development guidelines.
@@ -179,6 +180,18 @@ Logging tests cover correlation IDs, latency, safe error metadata, sensitive-dat
 exclusion, and isolation between concurrent requests. SDK tests verify that the
 actual configured model appears in request logs without exposing API keys.
 
+The suite also exercises the complete API-to-mocked-provider path: recovery after
+a retry, exhausted timeouts (504), exhausted rate limits and provider failures
+(503), authentication failures without retry, and invalid configuration without
+provider access. Mixed failures verify that the last attempt determines the HTTP
+error. Logging tests cover concurrent success/failure requests and invalid service
+responses without exposing their contents.
+
+`tests/conftest.py` blocks the real synchronous and asynchronous HTTPX transports.
+An omitted provider mock therefore fails the test before an outbound HTTP request
+can be sent. FastAPI's in-process test transport and SDK `MockTransport` remain
+available. Tests use dummy credentials and require no real OpenAI access.
+
 ## Domain models and validation
 
 `app/enums.py` defines the planned category, priority, and department values.
@@ -291,6 +304,7 @@ app/
     service.py
 tests/
     .gitkeep
+    conftest.py
     test_api.py
     test_config.py
     test_llm_client.py

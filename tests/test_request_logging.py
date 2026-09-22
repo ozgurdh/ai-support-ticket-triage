@@ -98,6 +98,19 @@ def test_missing_or_unsafe_ids_are_replaced_with_unique_ids(
     assert all(log["model"] is None and log["error_type"] is None for log in logs)
 
 
+@pytest.mark.parametrize("request_id", ["a", "x" * 64, "Request_1.2-abc"])
+def test_valid_request_id_boundaries_are_preserved(
+    client: TestClient, caplog: pytest.LogCaptureFixture, request_id: str
+) -> None:
+    response = client.get("/health", headers={"x-request-id": request_id})
+
+    assert response.status_code == 200
+    assert response.headers["X-Request-ID"] == request_id
+    records = request_records(caplog)
+    assert len(records) == 1
+    assert json.loads(records[0].getMessage())["request_id"] == request_id
+
+
 @pytest.mark.parametrize(
     "error,status",
     [
@@ -142,10 +155,21 @@ def test_failure_logs_safe_type_and_matching_id_once(
     assert health_log["error_type"] is None
 
 
+@pytest.mark.parametrize("malformed", [False, True])
 def test_invalid_input_is_logged_without_body_or_llm_call(
-    client: TestClient, classifier: Mock, caplog: pytest.LogCaptureFixture
+    client: TestClient,
+    classifier: Mock,
+    caplog: pytest.LogCaptureFixture,
+    malformed: bool,
 ) -> None:
-    response = client.post("/api/v1/triage", json={"subject": TICKET["subject"]})
+    body = (
+        '{"private-secret":'
+        if malformed
+        else json.dumps({"subject": TICKET["subject"]})
+    )
+    response = client.post(
+        "/api/v1/triage", content=body, headers={"Content-Type": "application/json"}
+    )
 
     assert response.status_code == 422
     classifier.assert_not_called()
@@ -174,14 +198,20 @@ def test_unmatched_url_is_not_logged(
     assert "private-" not in records[0].getMessage()
 
 
+@pytest.mark.parametrize("first_fails", [False, True])
 def test_concurrent_requests_keep_model_and_id_isolated(
-    client: TestClient, classifier: Mock, caplog: pytest.LogCaptureFixture
+    client: TestClient,
+    classifier: Mock,
+    caplog: pytest.LogCaptureFixture,
+    first_fails: bool,
 ) -> None:
     barrier = Barrier(2)
 
     def classify(ticket: TicketRequest) -> LLMClassificationResult:
         request_logging.record_model(f"model-{ticket.ticket_id}")
         barrier.wait(timeout=5)
+        if first_fails and ticket.ticket_id == "first":
+            raise llm_client.LLMTimeoutError("private-timeout-details")
         return CLASSIFICATION
 
     def send(request_id: str) -> None:
@@ -190,7 +220,8 @@ def test_concurrent_requests_keep_model_and_id_isolated(
             json={**TICKET, "ticket_id": request_id},
             headers={"X-Request-ID": request_id},
         )
-        assert response.status_code == 200
+        expected = 504 if first_fails and request_id == "first" else 200
+        assert response.status_code == expected
         assert response.headers["X-Request-ID"] == request_id
 
     classifier.side_effect = classify
@@ -203,3 +234,36 @@ def test_concurrent_requests_keep_model_and_id_isolated(
         "first": "model-first",
         "second": "model-second",
     }
+    assert {log["request_id"]: log["error_type"] for log in logs} == {
+        "first": "LLMTimeoutError" if first_fails else None,
+        "second": None,
+    }
+    assert all(
+        "private-" not in record.getMessage() for record in request_records(caplog)
+    )
+
+
+def test_invalid_service_response_is_logged_without_private_output(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(
+        main.service,
+        "triage_ticket",
+        Mock(return_value={"summary": "private-output-secret"}),
+    )
+    response = client.post(
+        "/api/v1/triage", json=TICKET, headers={"X-Request-ID": "failed-response"}
+    )
+
+    assert response.status_code == 500
+    assert response.headers["X-Request-ID"] == "failed-response"
+    records = request_records(caplog)
+    assert len(records) == 1
+    log = json.loads(records[0].getMessage())
+    assert log["request_id"] == "failed-response"
+    assert log["status_code"] == 500
+    assert log["error_type"] == "ResponseValidationError"
+    assert "private-" not in records[0].getMessage()
+    assert records[0].exc_info is None

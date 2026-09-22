@@ -91,10 +91,11 @@ def test_triage_preserves_optional_ticket_id(
         llm_client.LLMClientError,
         llm_client.LLMTimeoutError,
         llm_client.LLMResponseError,
+        RuntimeError,
     ],
 )
 def test_client_errors_propagate_without_fallback_or_retry(
-    classifier: Mock, error_type: type[llm_client.LLMClientError]
+    classifier: Mock, error_type: type[Exception]
 ) -> None:
     ticket = TicketRequest(
         subject="Printer", description="The printer prints blank pages."

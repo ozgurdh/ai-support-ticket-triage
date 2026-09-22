@@ -4,7 +4,6 @@ from collections.abc import Iterator
 from unittest.mock import Mock, call
 
 import pytest
-from fastapi.exceptions import ResponseValidationError
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
@@ -182,15 +181,22 @@ def test_triage_rejects_invalid_request_bodies(
 
 
 def test_triage_enforces_response_schema(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch, classifier: Mock
 ) -> None:
     # Simulate an invalid service result to exercise FastAPI's response validation.
     monkeypatch.setattr(
-        main.service, "triage_ticket", Mock(return_value={"priority": "invalid"})
+        main.service,
+        "triage_ticket",
+        Mock(return_value={"priority": "invalid", "summary": "Private output"}),
     )
 
-    with pytest.raises(ResponseValidationError):
-        client.post("/api/v1/triage", json=TICKET)
+    with TestClient(main.app, raise_server_exceptions=False) as client:
+        response = client.post("/api/v1/triage", json=TICKET)
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Internal server error."}
+    assert response.headers["X-Request-ID"]
+    classifier.assert_not_called()
 
 
 @pytest.mark.parametrize(

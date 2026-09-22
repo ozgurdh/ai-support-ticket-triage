@@ -182,6 +182,7 @@ def test_response_accepts_departments(department: Department) -> None:
     "field,value",
     [
         ("category", "billing"),
+        ("category", None),
         ("category", "ACCESS_AUTHENTICATION"),
         ("priority", "urgent"),
         ("priority", None),
@@ -204,7 +205,12 @@ def test_result_rejects_invalid_fields(
 
 @pytest.mark.parametrize(
     "field,value",
-    [("department", "finance"), ("needs_human_review", None), ("ticket_id", "x" * 101)],
+    [
+        ("department", "finance"),
+        ("needs_human_review", None),
+        ("needs_human_review", "unknown"),
+        ("ticket_id", "x" * 101),
+    ],
 )
 def test_response_rejects_invalid_additional_fields(field: str, value: object) -> None:
     with pytest.raises(ValidationError) as error:
@@ -235,6 +241,26 @@ def test_classification_serializes_only_classification_fields() -> None:
     result = LLMClassificationResult.model_validate(CLASSIFICATION)
 
     assert json.loads(result.model_dump_json()) == CLASSIFICATION
+
+
+@pytest.mark.parametrize(
+    "model,payload",
+    [(LLMClassificationResult, CLASSIFICATION), (TriageResponse, RESPONSE)],
+)
+def test_result_normalizes_text_without_losing_unicode(
+    model: type[BaseModel], payload: dict[str, object]
+) -> None:
+    result = model.model_validate(
+        {
+            **payload,
+            "summary": "  Yazıcı çalışmıyor 🖨️  ",
+            "suggested_action": "\n Bağlantıyı kontrol edin. \t",
+        }
+    )
+
+    serialized = json.loads(result.model_dump_json())
+    assert serialized["summary"] == "Yazıcı çalışmıyor 🖨️"
+    assert serialized["suggested_action"] == "Bağlantıyı kontrol edin."
 
 
 @pytest.mark.parametrize("ticket_id", ["TCK-1001", None])

@@ -8,7 +8,8 @@ from unittest.mock import Mock
 import httpx
 import pytest
 from fastapi.testclient import TestClient
-from openai import OpenAI
+from openai import APIResponseValidationError, OpenAI
+from openai.resources.responses import Responses
 from pydantic import ValidationError
 
 from app import llm_client, main
@@ -260,30 +261,55 @@ def test_transient_failure_recovers_on_second_attempt(
     sdk_factory: Mock,
     retry_sleep: Mock,
     failure: httpx.Response | Exception,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     provider.side_effect = [failure, httpx.Response(200, json=response_body())]
 
-    result = llm_client.classify_ticket(TICKET)
+    with TestClient(main.app) as client:
+        response = client.post("/api/v1/triage", json=TICKET.model_dump())
 
-    assert result.model_dump(mode="json") == CLASSIFICATION
+    assert response.status_code == 200
+    assert response.json() == {
+        **CLASSIFICATION,
+        "ticket_id": TICKET.ticket_id,
+        "department": "identity_access",
+        "needs_human_review": False,
+    }
     assert provider.call_count == 2
     sdk_factory.assert_called_once()
     retry_sleep.assert_called_once_with(0.5)
     first, second = [call.args[0] for call in provider.call_args_list]
     assert first.content == second.content
+    logs = [record for record in caplog.records if record.name == "app.requests"]
+    assert len(logs) == 1
+    metadata = json.loads(logs[0].getMessage())
+    assert metadata["request_id"] == response.headers["X-Request-ID"]
+    assert metadata["status_code"] == 200
+    assert metadata["error_type"] is None
+    assert metadata["model"] == "test-model"
 
 
-def test_permanent_failure_after_timeout_stops_retry(provider: Mock) -> None:
-    provider.side_effect = [
-        httpx.ReadTimeout("Private timeout"),
-        httpx.Response(401, json={"error": {"message": "Private credentials"}}),
-        httpx.Response(200, json=response_body()),
+@pytest.mark.parametrize("timeout_last", [False, True])
+def test_final_failure_determines_http_status(
+    provider: Mock, timeout_last: bool, retry_sleep: Mock
+) -> None:
+    failures = [
+        httpx.ReadTimeout("Private"),
+        httpx.Response(503, json={"error": {"message": "Private"}}),
     ]
+    provider.side_effect = list(reversed(failures)) if timeout_last else failures
 
-    with pytest.raises(llm_client.LLMClientError, match="^Provider request failed\\.$"):
-        llm_client.classify_ticket(TICKET)
+    with TestClient(main.app) as client:
+        response = client.post("/api/v1/triage", json=TICKET.model_dump())
 
+    assert response.status_code == (504 if timeout_last else 503)
+    assert response.json() == {
+        "detail": (
+            "Provider request timed out." if timeout_last else "Provider unavailable."
+        )
+    }
     assert provider.call_count == 2
+    retry_sleep.assert_called_once_with(0.5)
 
 
 @pytest.mark.parametrize(
@@ -331,8 +357,14 @@ def test_server_retry_restrictions_are_respected(
 def test_local_result_validation_is_not_retried(
     monkeypatch: pytest.MonkeyPatch, retry_sleep: Mock
 ) -> None:
-    request = Mock(return_value={**CLASSIFICATION, "category": "invalid"})
-    monkeypatch.setattr(llm_client, "_request_classification", request)
+    request = Mock(
+        return_value=Mock(
+            status="completed",
+            output=[],
+            output_parsed={**CLASSIFICATION, "category": "invalid"},
+        )
+    )
+    monkeypatch.setattr(Responses, "parse", request)
 
     with pytest.raises(ValidationError):
         llm_client.classify_ticket(TICKET)
@@ -359,39 +391,120 @@ def test_local_prompt_validation_makes_no_request(
     retry_sleep.assert_not_called()
 
 
-def test_configuration_failure_makes_no_request(
-    monkeypatch: pytest.MonkeyPatch, sdk_factory: Mock, provider: Mock
+@pytest.mark.parametrize("recover", [False, True])
+def test_sdk_response_validation_failure_recovers_or_exhausts(
+    monkeypatch: pytest.MonkeyPatch, retry_sleep: Mock, recover: bool
 ) -> None:
-    monkeypatch.delenv("OPENAI_API_KEY")
+    failure = APIResponseValidationError(
+        response=httpx.Response(
+            200, request=httpx.Request("POST", "https://provider.invalid")
+        ),
+        body={"private": "provider-payload"},
+    )
+    valid_response = Mock(
+        status="completed",
+        output=[],
+        output_parsed=LLMClassificationResult(**CLASSIFICATION),
+    )
+    parse = Mock(side_effect=[failure, valid_response if recover else failure])
+    monkeypatch.setattr(Responses, "parse", parse)
 
-    with pytest.raises(ValidationError):
+    if recover:
+        assert (
+            llm_client.classify_ticket(TICKET).model_dump(mode="json") == CLASSIFICATION
+        )
+    else:
+        with pytest.raises(
+            llm_client.LLMResponseError,
+            match="^Provider returned an invalid classification\\.$",
+        ):
+            llm_client.classify_ticket(TICKET)
+
+    assert parse.call_count == 2
+    retry_sleep.assert_called_once_with(0.5)
+
+
+def test_sdk_local_validation_error_is_not_retried(
+    monkeypatch: pytest.MonkeyPatch, provider: Mock, retry_sleep: Mock
+) -> None:
+    with pytest.raises(ValidationError) as original:
+        TicketRequest.model_validate({})
+    parse = Mock(side_effect=original.value)
+    monkeypatch.setattr(Responses, "parse", parse)
+
+    with pytest.raises(ValidationError) as raised:
         llm_client.classify_ticket(TICKET)
 
-    sdk_factory.assert_not_called()
+    assert raised.value is original.value
+    parse.assert_called_once()
     provider.assert_not_called()
+    retry_sleep.assert_not_called()
+
+
+def test_quota_error_identified_by_type_is_not_retried(
+    provider: Mock, retry_sleep: Mock
+) -> None:
+    provider.return_value = httpx.Response(
+        429,
+        json={
+            "error": {
+                "message": "Private billing details",
+                "type": "insufficient_quota",
+            }
+        },
+    )
+
+    with pytest.raises(llm_client.LLMClientError, match="^Provider request failed\\.$"):
+        llm_client.classify_ticket(TICKET)
+
+    provider.assert_called_once()
+    retry_sleep.assert_not_called()
 
 
 @pytest.mark.parametrize(
-    "failure,status,detail",
+    "failure,status,detail,attempts",
     [
-        (httpx.ReadTimeout("Private"), 504, "Provider request timed out."),
+        (httpx.ReadTimeout("Private"), 504, "Provider request timed out.", 2),
+        (httpx.ConnectError("Private"), 503, "Provider unavailable.", 2),
+        (
+            httpx.Response(429, json={"error": {"message": "Private"}}),
+            503,
+            "Provider unavailable.",
+            2,
+        ),
+        (
+            httpx.Response(401, json={"error": {"message": "Private"}}),
+            503,
+            "Provider unavailable.",
+            1,
+        ),
+        (
+            httpx.Response(504, json={"error": {"message": "Private"}}),
+            504,
+            "Provider request timed out.",
+            2,
+        ),
         (
             httpx.Response(503, json={"error": {"message": "Private"}}),
             503,
             "Provider unavailable.",
+            2,
         ),
         (
             httpx.Response(200, json=response_body("Private invalid JSON")),
             503,
             "Provider unavailable.",
+            2,
         ),
     ],
 )
-def test_exhausted_provider_failure_reaches_http_response(
+def test_provider_failure_reaches_http_response_after_allowed_attempts(
     provider: Mock,
     failure: httpx.Response | Exception,
     status: int,
     detail: str,
+    attempts: int,
+    retry_sleep: Mock,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     provider.side_effect = [failure, failure]
@@ -400,7 +513,8 @@ def test_exhausted_provider_failure_reaches_http_response(
 
     assert response.status_code == status
     assert response.json() == {"detail": detail}
-    assert provider.call_count == 2
+    assert provider.call_count == attempts
+    assert retry_sleep.call_count == attempts - 1
     logs = [record for record in caplog.records if record.name == "app.requests"]
     assert len(logs) == 1  # Retries belong to the same HTTP request.
     metadata = json.loads(logs[0].getMessage())
@@ -412,13 +526,28 @@ def test_exhausted_provider_failure_reaches_http_response(
     assert "test-only-key" not in logs[0].getMessage()
 
 
-def test_missing_configuration_returns_safe_500_without_provider_call(
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("OPENAI_API_KEY", None),
+        ("OPENAI_MODEL", None),
+        ("OPENAI_MODEL", "  "),
+        ("OPENAI_TIMEOUT_SECONDS", "0"),
+    ],
+)
+def test_invalid_configuration_returns_safe_500_without_provider_call(
     monkeypatch: pytest.MonkeyPatch,
     provider: Mock,
     sdk_factory: Mock,
     caplog: pytest.LogCaptureFixture,
+    retry_sleep: Mock,
+    name: str,
+    value: str | None,
 ) -> None:
-    monkeypatch.delenv("OPENAI_API_KEY")
+    if value is None:
+        monkeypatch.delenv(name)
+    else:
+        monkeypatch.setenv(name, value)
     with TestClient(main.app, raise_server_exceptions=False) as client:
         response = client.post("/api/v1/triage", json=TICKET.model_dump())
 
@@ -426,6 +555,7 @@ def test_missing_configuration_returns_safe_500_without_provider_call(
     assert response.json() == {"detail": "Internal server error."}
     provider.assert_not_called()
     sdk_factory.assert_not_called()
+    retry_sleep.assert_not_called()
     logs = [record for record in caplog.records if record.name == "app.requests"]
     assert len(logs) == 1
     metadata = json.loads(logs[0].getMessage())
