@@ -6,6 +6,7 @@ from unittest.mock import Mock, call
 import pytest
 from fastapi.exceptions import ResponseValidationError
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from app import llm_client, main
 from app.schemas import LLMClassificationResult, TicketRequest, TriageResponse
@@ -192,6 +193,60 @@ def test_triage_enforces_response_schema(
         client.post("/api/v1/triage", json=TICKET)
 
 
+@pytest.mark.parametrize(
+    "error,status,detail",
+    [
+        (
+            llm_client.LLMClientError("Private provider details"),
+            503,
+            "Provider unavailable.",
+        ),
+        (
+            llm_client.LLMResponseError("Private model output"),
+            503,
+            "Provider unavailable.",
+        ),
+        (
+            llm_client.LLMTimeoutError("Private timeout details"),
+            504,
+            "Provider request timed out.",
+        ),
+    ],
+)
+def test_provider_failures_return_safe_http_errors(
+    client: TestClient, classifier: Mock, error: Exception, status: int, detail: str
+) -> None:
+    classifier.side_effect = error
+
+    response = client.post("/api/v1/triage", json=TICKET)
+
+    assert response.status_code == status
+    assert response.json() == {"detail": detail}
+    classifier.assert_called_once()
+
+
+def test_unexpected_error_returns_safe_500(classifier: Mock) -> None:
+    classifier.side_effect = RuntimeError("Private implementation details and secret")
+    with TestClient(main.app, raise_server_exceptions=False) as client:
+        response = client.post("/api/v1/triage", json=TICKET)
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Internal server error."}
+    classifier.assert_called_once()
+
+
+def test_local_validation_error_returns_500_not_request_422(classifier: Mock) -> None:
+    with pytest.raises(ValidationError) as error:
+        LLMClassificationResult.model_validate({"summary": "Private model output"})
+    classifier.side_effect = error.value
+    with TestClient(main.app, raise_server_exceptions=False) as client:
+        response = client.post("/api/v1/triage", json=TICKET)
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Internal server error."}
+    classifier.assert_called_once()
+
+
 def test_swagger_docs(client: TestClient) -> None:
     response = client.get("/docs")
 
@@ -216,4 +271,4 @@ def test_openapi_documents_existing_request_and_response_schemas(
     assert operation["responses"]["200"]["content"]["application/json"]["schema"] == {
         "$ref": "#/components/schemas/TriageResponse"
     }
-    assert "422" in operation["responses"]
+    assert {"422", "500", "503", "504"} <= operation["responses"].keys()

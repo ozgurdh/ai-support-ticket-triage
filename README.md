@@ -14,8 +14,8 @@ builder, taxonomy descriptions, priority rubric, and input trust instructions.
 TASK-005 adds a standalone OpenAI client with structured classification, validated
 environment settings, and timeout/error foundations. TASK-006 connects the API to
 the LLM client through a service that derives department routing and human review.
-Retries, provider-specific HTTP error mapping, evaluation, Docker, and CI are
-scheduled for later tasks.
+TASK-007 adds bounded retries for transient provider failures and safe HTTP error
+responses. Request logging, evaluation, Docker, and CI are scheduled for later tasks.
 
 See [the project plan](docs/PROJECT_PLAN.md) for the specification and roadmap,
 and [AGENTS.md](AGENTS.md) for development guidelines.
@@ -97,8 +97,16 @@ Illustrative response (model-generated values may vary):
 The response preserves the validated `ticket_id`, which is `null` when omitted.
 Invalid requests return HTTP 422 before calling the LLM client. The endpoint uses
 `TicketRequest` and `TriageResponse` for request and response validation.
-Provider and configuration errors currently produce the default HTTP 500 response;
-retry policies and specific provider HTTP error mapping belong to TASK-007.
+Failures return the following HTTP responses after any eligible retry:
+
+| Failure | Status | Response detail |
+| --- | --- | --- |
+| Invalid request | 422 | Request validation errors |
+| Provider unavailable or invalid classification | 503 | `Provider unavailable.` |
+| Provider timeout | 504 | `Provider request timed out.` |
+| Configuration or unexpected server error | 500 | `Internal server error.` |
+
+Provider and server error responses do not expose exception details or model output.
 
 ## Environment variables
 
@@ -134,13 +142,15 @@ Schema tests cover field requirements, length boundaries, enum values, invalid
 input, and JSON serialization. Service tests cover all category/priority combinations,
 field preservation, and propagation of client errors. Service and API tests mock
 the LLM client. API tests exercise routing, human review, request and response
-validation, health, Swagger, and OpenAPI. Prompt tests cover taxonomy
+validation, safe error responses, health, Swagger, and OpenAPI. Prompt tests cover taxonomy
 and rubric coverage, output instructions, ticket formatting, and separation of
 ticket content from system instructions. Tests run without API keys or real LLM
 calls; they do not measure model accuracy or resistance to prompt injection.
 Settings tests isolate environment and dotenv values. LLM client tests exercise
 the SDK against an in-memory HTTP mock, including structured-output validation,
-timeouts, provider errors, refusals, and incomplete responses.
+timeouts, provider errors, refusals, and incomplete responses. Retry tests cover
+recovery, the two-attempt limit, non-retryable failures, and propagation to HTTP
+responses. Retry delays are mocked so tests do not sleep.
 
 ## Domain models and validation
 
@@ -216,16 +226,28 @@ result = classify_ticket(ticket)
 ```
 
 An optional `Settings` instance can supply configuration explicitly. The client
-requests `store=False` and closes its SDK connection after each call. Each call
-makes one attempt, with SDK retries disabled. The configured timeout applies to
-SDK network operations; it is not an overall application deadline.
+requests `store=False` and closes its SDK connection after each call. Tenacity
+allows at most two attempts with a fixed 0.5-second delay. SDK retries remain
+disabled so they cannot multiply the attempt count. The configured timeout
+applies to SDK network operations on each attempt; it is not an overall
+application deadline.
+
+Connection failures, timeouts, HTTP 408/409/429 and temporary server errors
+(500/502/503/504), and malformed or missing structured output may retry.
+Credentials, invalid requests, quota/billing failures, configuration errors,
+and local schema validation do not retry. Refusals and incomplete responses
+reported by the SDK also fail without retry. When the provider sends a
+`Retry-After`/`retry-after-ms` header or explicitly forbids retry, the client
+returns the failure immediately rather than retrying ahead of the provider's
+delay or waiting for an unbounded interval.
 
 `LLMTimeoutError` identifies timeouts, `LLMResponseError` identifies invalid,
 missing, refused, or incomplete classifications, and `LLMClientError` handles
 other provider failures. These errors use generic messages without provider
 payloads. Missing or invalid settings raise local Pydantic validation errors
-before any provider request. Routing, human-review decisions, HTTP error mapping,
-and retry policies are not implemented in this client.
+before any provider request. Provider error handling and retry policy stay in
+`llm_client.py`; HTTP error mapping stays in `main.py`. Routing and human-review
+decisions remain in the service.
 
 ## Repository structure
 

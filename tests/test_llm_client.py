@@ -7,10 +7,11 @@ from unittest.mock import Mock
 
 import httpx
 import pytest
+from fastapi.testclient import TestClient
 from openai import OpenAI
 from pydantic import ValidationError
 
-from app import llm_client
+from app import llm_client, main
 from app.config import Settings
 from app.prompt import build_messages
 from app.schemas import LLMClassificationResult, TicketRequest
@@ -52,6 +53,13 @@ def response_body(
 @pytest.fixture
 def provider() -> Mock:
     return Mock(return_value=httpx.Response(200, json=response_body()))
+
+
+@pytest.fixture(autouse=True)
+def retry_sleep(monkeypatch: pytest.MonkeyPatch) -> Mock:
+    sleeper = Mock()
+    monkeypatch.setattr(llm_client, "sleep", sleeper)
+    return sleeper
 
 
 @pytest.fixture(autouse=True)
@@ -131,13 +139,16 @@ def test_accepts_explicit_settings(provider: Mock, sdk_factory: Mock) -> None:
         json.dumps({**CLASSIFICATION, "department": "security"}),
     ],
 )
-def test_invalid_structured_output_is_rejected(provider: Mock, text: str) -> None:
+def test_invalid_structured_output_exhausts_retry(
+    provider: Mock, retry_sleep: Mock, text: str
+) -> None:
     provider.return_value = httpx.Response(200, json=response_body(text))
 
     with pytest.raises(llm_client.LLMResponseError, match="invalid classification"):
         llm_client.classify_ticket(TICKET)
 
-    provider.assert_called_once()
+    assert provider.call_count == 2
+    retry_sleep.assert_called_once_with(0.5)
 
 
 @pytest.mark.parametrize("status", ["incomplete", "failed", "cancelled"])
@@ -146,6 +157,8 @@ def test_non_completed_response_is_rejected(provider: Mock, status: str) -> None
 
     with pytest.raises(llm_client.LLMResponseError):
         llm_client.classify_ticket(TICKET)
+
+    provider.assert_called_once()
 
 
 @pytest.mark.parametrize("refusal", [False, True])
@@ -165,7 +178,7 @@ def test_absent_classification_or_refusal_is_rejected(
         llm_client.classify_ticket(TICKET)
 
     assert "Private provider" not in str(error.value)
-    provider.assert_called_once()
+    assert provider.call_count == (1 if refusal else 2)
 
 
 @pytest.mark.parametrize(
@@ -175,8 +188,8 @@ def test_absent_classification_or_refusal_is_rejected(
         (httpx.ConnectError("Private connection details"), llm_client.LLMClientError),
     ],
 )
-def test_transport_failure_is_wrapped_without_retry(
-    provider: Mock, failure: Exception, expected: type[Exception]
+def test_transport_failure_exhausts_retry(
+    provider: Mock, retry_sleep: Mock, failure: Exception, expected: type[Exception]
 ) -> None:
     provider.side_effect = failure
 
@@ -184,11 +197,28 @@ def test_transport_failure_is_wrapped_without_retry(
         llm_client.classify_ticket(TICKET)
 
     assert "Private" not in str(error.value)
-    provider.assert_called_once()
+    assert provider.call_count == 2
+    retry_sleep.assert_called_once_with(0.5)
 
 
-@pytest.mark.parametrize("status", [400, 401, 429, 500, 503])
-def test_provider_error_is_wrapped_without_retry(provider: Mock, status: int) -> None:
+@pytest.mark.parametrize(
+    "status,attempts",
+    [
+        (400, 1),
+        (401, 1),
+        (403, 1),
+        (404, 1),
+        (422, 1),
+        (409, 2),
+        (429, 2),
+        (500, 2),
+        (502, 2),
+        (503, 2),
+    ],
+)
+def test_provider_error_is_wrapped_after_allowed_attempts(
+    provider: Mock, retry_sleep: Mock, status: int, attempts: int
+) -> None:
     provider.return_value = httpx.Response(
         status, json={"error": {"message": "Private provider details", "type": "error"}}
     )
@@ -196,7 +226,137 @@ def test_provider_error_is_wrapped_without_retry(provider: Mock, status: int) ->
     with pytest.raises(llm_client.LLMClientError, match="^Provider request failed\\.$"):
         llm_client.classify_ticket(TICKET)
 
+    assert provider.call_count == attempts
+    assert retry_sleep.call_count == attempts - 1
+
+
+@pytest.mark.parametrize("status", [408, 504])
+def test_provider_http_timeout_exhausts_retry(provider: Mock, status: int) -> None:
+    provider.return_value = httpx.Response(
+        status, json={"error": {"message": "Private"}}
+    )
+
+    with pytest.raises(
+        llm_client.LLMTimeoutError, match="^Provider request timed out\\.$"
+    ):
+        llm_client.classify_ticket(TICKET)
+
+    assert provider.call_count == 2
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        httpx.ReadTimeout("Private"),
+        httpx.ConnectError("Private"),
+        httpx.Response(429, json={"error": {"message": "Rate limited"}}),
+        httpx.Response(503, json={"error": {"message": "Unavailable"}}),
+        httpx.Response(200, json=response_body("not JSON")),
+        httpx.Response(200, json={**response_body(), "output": []}),
+    ],
+)
+def test_transient_failure_recovers_on_second_attempt(
+    provider: Mock,
+    sdk_factory: Mock,
+    retry_sleep: Mock,
+    failure: httpx.Response | Exception,
+) -> None:
+    provider.side_effect = [failure, httpx.Response(200, json=response_body())]
+
+    result = llm_client.classify_ticket(TICKET)
+
+    assert result.model_dump(mode="json") == CLASSIFICATION
+    assert provider.call_count == 2
+    sdk_factory.assert_called_once()
+    retry_sleep.assert_called_once_with(0.5)
+    first, second = [call.args[0] for call in provider.call_args_list]
+    assert first.content == second.content
+
+
+def test_permanent_failure_after_timeout_stops_retry(provider: Mock) -> None:
+    provider.side_effect = [
+        httpx.ReadTimeout("Private timeout"),
+        httpx.Response(401, json={"error": {"message": "Private credentials"}}),
+        httpx.Response(200, json=response_body()),
+    ]
+
+    with pytest.raises(llm_client.LLMClientError, match="^Provider request failed\\.$"):
+        llm_client.classify_ticket(TICKET)
+
+    assert provider.call_count == 2
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "insufficient_quota",
+        "credit_balance_exhausted",
+        "organization_spend_limit_exceeded",
+        "project_spend_limit_exceeded",
+        "organization_usage_limit_exceeded",
+    ],
+)
+def test_quota_failure_is_not_retried(
+    provider: Mock, retry_sleep: Mock, code: str
+) -> None:
+    provider.return_value = httpx.Response(
+        429, json={"error": {"message": "Private billing details", "code": code}}
+    )
+
+    with pytest.raises(llm_client.LLMClientError):
+        llm_client.classify_ticket(TICKET)
+
     provider.assert_called_once()
+    retry_sleep.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [{"retry-after": "60"}, {"retry-after-ms": "60000"}, {"x-should-retry": "false"}],
+)
+def test_server_retry_restrictions_are_respected(
+    provider: Mock, retry_sleep: Mock, headers: dict[str, str]
+) -> None:
+    provider.return_value = httpx.Response(
+        429, headers=headers, json={"error": {"message": "Private"}}
+    )
+
+    with pytest.raises(llm_client.LLMClientError):
+        llm_client.classify_ticket(TICKET)
+
+    provider.assert_called_once()
+    retry_sleep.assert_not_called()
+
+
+def test_local_result_validation_is_not_retried(
+    monkeypatch: pytest.MonkeyPatch, retry_sleep: Mock
+) -> None:
+    request = Mock(return_value={**CLASSIFICATION, "category": "invalid"})
+    monkeypatch.setattr(llm_client, "_request_classification", request)
+
+    with pytest.raises(ValidationError):
+        llm_client.classify_ticket(TICKET)
+
+    request.assert_called_once()
+    retry_sleep.assert_not_called()
+
+
+def test_local_prompt_validation_makes_no_request(
+    monkeypatch: pytest.MonkeyPatch,
+    sdk_factory: Mock,
+    provider: Mock,
+    retry_sleep: Mock,
+) -> None:
+    with pytest.raises(ValidationError) as error:
+        TicketRequest.model_validate({})
+    monkeypatch.setattr(llm_client, "build_messages", Mock(side_effect=error.value))
+
+    with pytest.raises(ValidationError):
+        llm_client.classify_ticket(TICKET)
+
+    sdk_factory.assert_not_called()
+    provider.assert_not_called()
+    retry_sleep.assert_not_called()
 
 
 def test_configuration_failure_makes_no_request(
@@ -209,3 +369,44 @@ def test_configuration_failure_makes_no_request(
 
     sdk_factory.assert_not_called()
     provider.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "failure,status,detail",
+    [
+        (httpx.ReadTimeout("Private"), 504, "Provider request timed out."),
+        (
+            httpx.Response(503, json={"error": {"message": "Private"}}),
+            503,
+            "Provider unavailable.",
+        ),
+        (
+            httpx.Response(200, json=response_body("Private invalid JSON")),
+            503,
+            "Provider unavailable.",
+        ),
+    ],
+)
+def test_exhausted_provider_failure_reaches_http_response(
+    provider: Mock, failure: httpx.Response | Exception, status: int, detail: str
+) -> None:
+    provider.side_effect = [failure, failure]
+    with TestClient(main.app) as client:
+        response = client.post("/api/v1/triage", json=TICKET.model_dump())
+
+    assert response.status_code == status
+    assert response.json() == {"detail": detail}
+    assert provider.call_count == 2
+
+
+def test_missing_configuration_returns_safe_500_without_provider_call(
+    monkeypatch: pytest.MonkeyPatch, provider: Mock, sdk_factory: Mock
+) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY")
+    with TestClient(main.app, raise_server_exceptions=False) as client:
+        response = client.post("/api/v1/triage", json=TICKET.model_dump())
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Internal server error."}
+    provider.assert_not_called()
+    sdk_factory.assert_not_called()
