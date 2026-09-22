@@ -1,18 +1,34 @@
 """HTTP contract tests for the basic application; no provider calls are made."""
 
 from collections.abc import Iterator
+from unittest.mock import Mock, call
 
 import pytest
 from fastapi.exceptions import ResponseValidationError
 from fastapi.testclient import TestClient
 
-from app import main
-from app.schemas import TriageResponse
+from app import llm_client, main
+from app.schemas import LLMClassificationResult, TicketRequest, TriageResponse
 
 TICKET = {
     "subject": "VPN connection problem",
     "description": "I cannot connect to the corporate VPN after changing my password.",
 }
+
+
+@pytest.fixture(autouse=True)
+def classifier(monkeypatch: pytest.MonkeyPatch) -> Mock:
+    mock = Mock(
+        spec=llm_client.classify_ticket,
+        return_value=LLMClassificationResult(
+            category="access_authentication",
+            priority="high",
+            summary="User cannot connect to the VPN after a password change.",
+            suggested_action="Verify credential synchronization.",
+        ),
+    )
+    monkeypatch.setattr(llm_client, "classify_ticket", mock)
+    return mock
 
 
 @pytest.fixture
@@ -23,18 +39,19 @@ def client(monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
         yield test_client
 
 
-def test_health(client: TestClient) -> None:
+def test_health(client: TestClient, classifier: Mock) -> None:
     response = client.get("/health")
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+    classifier.assert_not_called()
 
 
 @pytest.mark.parametrize(
     "id_fields", [{}, {"ticket_id": None}, {"ticket_id": "TCK-1001"}]
 )
-def test_triage_returns_valid_mock_response(
-    client: TestClient, id_fields: dict[str, str | None]
+def test_triage_returns_service_response(
+    client: TestClient, classifier: Mock, id_fields: dict[str, str | None]
 ) -> None:
     response = client.post("/api/v1/triage", json={**TICKET, **id_fields})
 
@@ -42,39 +59,87 @@ def test_triage_returns_valid_mock_response(
     assert response.headers["content-type"] == "application/json"
     assert response.json() == {
         "ticket_id": id_fields.get("ticket_id"),
-        "category": "other",
-        "department": "service_desk",
-        "priority": "medium",
-        "summary": "Mock triage result; ticket has not been classified.",
-        "suggested_action": "Review the ticket manually.",
-        "needs_human_review": True,
+        "category": "access_authentication",
+        "department": "identity_access",
+        "priority": "high",
+        "summary": "User cannot connect to the VPN after a password change.",
+        "suggested_action": "Verify credential synchronization.",
+        "needs_human_review": False,
     }
     TriageResponse.model_validate(response.json())
+    classifier.assert_called_once_with(TicketRequest(**TICKET, **id_fields))
 
 
-def test_triage_returns_same_mock_for_different_ticket_content(
+def test_triage_uses_each_classification_result(
     client: TestClient,
+    classifier: Mock,
 ) -> None:
-    first = client.post("/api/v1/triage", json=TICKET)
-    second = client.post(
-        "/api/v1/triage",
-        json={
-            "subject": "Printer problem",
-            "description": "The printer prints blank pages.",
-        },
+    printer_ticket = {
+        "subject": "Printer problem",
+        "description": "The printer prints blank pages.",
+    }
+    printer_result = LLMClassificationResult(
+        category="hardware_device",
+        priority="medium",
+        summary="Printer prints blank pages.",
+        suggested_action="Check the ink level.",
     )
+    classifier.side_effect = [classifier.return_value, printer_result]
+    first = client.post("/api/v1/triage", json=TICKET)
+    second = client.post("/api/v1/triage", json=printer_ticket)
 
     assert first.status_code == second.status_code == 200
-    assert first.json() == second.json()
+    assert first.json()["department"] == "identity_access"
+    assert second.json() == {
+        **printer_result.model_dump(mode="json"),
+        "ticket_id": None,
+        "department": "service_desk",
+        "needs_human_review": False,
+    }
+    assert classifier.call_args_list == [
+        call(TicketRequest(**TICKET)),
+        call(TicketRequest(**printer_ticket)),
+    ]
 
 
-def test_triage_preserves_validated_ticket_id(client: TestClient) -> None:
+@pytest.mark.parametrize(
+    "category,priority,department",
+    [
+        ("security_incident", "low", "security"),
+        ("other", "medium", "service_desk"),
+        ("network_connectivity", "critical", "infrastructure_network"),
+    ],
+)
+def test_triage_applies_human_review_rules(
+    client: TestClient, classifier: Mock, category: str, priority: str, department: str
+) -> None:
+    classifier.return_value = LLMClassificationResult(
+        category=category,
+        priority=priority,
+        summary="Ticket requires review.",
+        suggested_action="Review the reported issue.",
+    )
+
+    response = client.post("/api/v1/triage", json=TICKET)
+
+    assert response.status_code == 200
+    assert response.json()["category"] == category
+    assert response.json()["priority"] == priority
+    assert response.json()["department"] == department
+    assert response.json()["needs_human_review"] is True
+    classifier.assert_called_once()
+
+
+def test_triage_preserves_validated_ticket_id(
+    client: TestClient, classifier: Mock
+) -> None:
     response = client.post(
         "/api/v1/triage", json={**TICKET, "ticket_id": "  TCK-1001  "}
     )
 
     assert response.status_code == 200
     assert response.json()["ticket_id"] == "TCK-1001"
+    classifier.assert_called_once_with(TicketRequest(**TICKET, ticket_id="TCK-1001"))
 
 
 @pytest.mark.parametrize(
@@ -94,29 +159,33 @@ def test_triage_preserves_validated_ticket_id(client: TestClient) -> None:
     ],
 )
 def test_triage_rejects_invalid_tickets(
-    client: TestClient, payload: dict[str, object], field: str
+    client: TestClient, classifier: Mock, payload: dict[str, object], field: str
 ) -> None:
     response = client.post("/api/v1/triage", json=payload)
 
     assert response.status_code == 422
     assert response.json()["detail"][0]["loc"] == ["body", field]
+    classifier.assert_not_called()
 
 
 @pytest.mark.parametrize("body", ["", "{invalid json", "null", "[]"])
-def test_triage_rejects_invalid_request_bodies(client: TestClient, body: str) -> None:
+def test_triage_rejects_invalid_request_bodies(
+    client: TestClient, classifier: Mock, body: str
+) -> None:
     response = client.post(
         "/api/v1/triage", content=body, headers={"Content-Type": "application/json"}
     )
 
     assert response.status_code == 422
+    classifier.assert_not_called()
 
 
 def test_triage_enforces_response_schema(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Bypass construction validation to exercise FastAPI's response validation.
+    # Simulate an invalid service result to exercise FastAPI's response validation.
     monkeypatch.setattr(
-        main, "TriageResponse", lambda **fields: {**fields, "priority": "invalid"}
+        main.service, "triage_ticket", Mock(return_value={"priority": "invalid"})
     )
 
     with pytest.raises(ResponseValidationError):

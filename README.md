@@ -1,6 +1,6 @@
 # AI Support Ticket Triage API
 
-A planned FastAPI service for converting unstructured IT support tickets into
+A FastAPI service for converting unstructured IT support tickets into
 validated triage results using an LLM and deterministic business rules.
 
 ## Current status
@@ -12,8 +12,10 @@ schemas with automated tests. TASK-003 adds the health and triage endpoints with
 a deterministic mock response and Swagger documentation. TASK-004 adds the prompt
 builder, taxonomy descriptions, priority rubric, and input trust instructions.
 TASK-005 adds a standalone OpenAI client with structured classification, validated
-environment settings, and timeout/error foundations. API integration and business
-rules, retries, evaluation, Docker, and CI are scheduled for later tasks.
+environment settings, and timeout/error foundations. TASK-006 connects the API to
+the LLM client through a service that derives department routing and human review.
+Retries, provider-specific HTTP error mapping, evaluation, Docker, and CI are
+scheduled for later tasks.
 
 See [the project plan](docs/PROJECT_PLAN.md) for the specification and roadmap,
 and [AGENTS.md](AGENTS.md) for development guidelines.
@@ -50,7 +52,8 @@ python3 -m venv .venv
 
 ## Running locally
 
-Start the application from the repository root:
+Configure `.env` as described below to classify tickets, then start the application
+from the repository root:
 
 ```powershell
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --reload
@@ -60,11 +63,13 @@ On macOS / Linux, use `.venv/bin/python -m uvicorn app.main:app --reload`.
 Open [Swagger UI](http://localhost:8000/docs) to try the endpoints. The OpenAPI
 schema is available at [openapi.json](http://localhost:8000/openapi.json).
 
-## API usage (temporary mock)
+## API usage
 
-`GET /health` returns HTTP 200 with `{"status": "ok"}`.
+`GET /health` returns HTTP 200 with `{"status": "ok"}` without calling the provider.
 
-`POST /api/v1/triage` accepts a JSON ticket and returns HTTP 200 after validation.
+`POST /api/v1/triage` validates a JSON ticket, calls the configured LLM, and applies
+deterministic routing and review rules. It returns HTTP 200 on success. This now
+makes a real provider request and requires `OPENAI_API_KEY` and `OPENAI_MODEL`.
 For example, submit this body through Swagger UI:
 
 ```json
@@ -75,24 +80,25 @@ For example, submit this body through Swagger UI:
 }
 ```
 
-Response:
+Illustrative response (model-generated values may vary):
 
 ```json
 {
   "ticket_id": "TCK-1001",
-  "category": "other",
-  "department": "service_desk",
-  "priority": "medium",
-  "summary": "Mock triage result; ticket has not been classified.",
-  "suggested_action": "Review the ticket manually.",
-  "needs_human_review": true
+  "category": "access_authentication",
+  "department": "identity_access",
+  "priority": "high",
+  "summary": "User cannot connect to the VPN after a password change.",
+  "suggested_action": "Verify credential synchronization.",
+  "needs_human_review": false
 }
 ```
 
-Every valid ticket receives the same mock values except for its validated
-`ticket_id`, which is `null` when omitted. Ticket content is not classified yet.
-Invalid requests return HTTP 422. The endpoint uses `TicketRequest` and
-`TriageResponse` for request and response validation. No API key is required.
+The response preserves the validated `ticket_id`, which is `null` when omitted.
+Invalid requests return HTTP 422 before calling the LLM client. The endpoint uses
+`TicketRequest` and `TriageResponse` for request and response validation.
+Provider and configuration errors currently produce the default HTTP 500 response;
+retry policies and specific provider HTTP error mapping belong to TASK-007.
 
 ## Environment variables
 
@@ -106,7 +112,7 @@ Invalid requests return HTTP 422. The endpoint uses `TicketRequest` and
 | `OPENAI_TIMEOUT_SECONDS` | Positive, finite SDK timeout in seconds; defaults to 30. |
 
 To use the LLM client, copy `.env.example` to `.env` and set the key and model.
-Settings are loaded when the client is called, so imports, the current mock API,
+Settings are loaded when the client is called, so imports, health, API docs,
 and tests do not require credentials. API keys use Pydantic `SecretStr` to mask
 their normal representation. `.env` and local virtual environments are ignored
 by Git; never commit credentials.
@@ -125,8 +131,10 @@ Using the virtual environment's Python (Windows commands shown):
 On macOS / Linux, use `.venv/bin/python` instead.
 
 Schema tests cover field requirements, length boundaries, enum values, invalid
-input, and JSON serialization. API tests cover health, mock triage responses,
-request and response validation, Swagger, and OpenAPI. Prompt tests cover taxonomy
+input, and JSON serialization. Service tests cover all category/priority combinations,
+field preservation, and propagation of client errors. Service and API tests mock
+the LLM client. API tests exercise routing, human review, request and response
+validation, health, Swagger, and OpenAPI. Prompt tests cover taxonomy
 and rubric coverage, output instructions, ticket formatting, and separation of
 ticket content from system instructions. Tests run without API keys or real LLM
 calls; they do not measure model accuracy or resistance to prompt injection.
@@ -148,9 +156,28 @@ timeouts, provider errors, refusals, and incomplete responses.
 
 Surrounding whitespace is stripped from text fields before length validation.
 Summary and suggested action must contain at least one non-whitespace character.
-Unknown fields and invalid enum values are rejected. Department routing and
-human-review decisions will be implemented in the service task; these schemas
-only validate the supplied fields.
+Unknown fields and invalid enum values are rejected. Schemas validate supplied
+fields; the service derives department routing and human-review decisions.
+
+## Triage service
+
+`app.service.triage_ticket(ticket)` calls the existing LLM client once, preserves
+its category, priority, summary, and suggested action, and builds a `TriageResponse`.
+The service derives the department using this mapping:
+
+| Category | Department |
+| --- | --- |
+| `access_authentication` | `identity_access` |
+| `software_application` | `application_support` |
+| `hardware_device` | `service_desk` |
+| `network_connectivity` | `infrastructure_network` |
+| `security_incident` | `security` |
+| `other` | `service_desk` |
+
+`needs_human_review` is true when the category is `security_incident` or `other`,
+or the priority is `critical`. It is false otherwise. Both rules live in the
+service and are independent of model-generated text. The service propagates
+client errors without retrying or returning a fallback classification.
 
 ## Prompt builder
 
@@ -164,8 +191,7 @@ project plan's definitions. It requests only the four classification fields,
 requires factual summaries and a safe initial action, and instructs the model to
 treat ticket text as untrusted data and ignore embedded instructions.
 
-The LLM client uses this builder. The triage endpoint continues to return its
-temporary mock response until the service integration task.
+The LLM client uses this builder when called by the triage service.
 
 ## LLM client
 
@@ -212,6 +238,7 @@ app/
     main.py
     prompt.py
     schemas.py
+    service.py
 tests/
     .gitkeep
     test_api.py
@@ -219,6 +246,7 @@ tests/
     test_llm_client.py
     test_prompt.py
     test_schemas.py
+    test_service.py
 docs/
     PROJECT_PLAN.md
 AGENTS.md
