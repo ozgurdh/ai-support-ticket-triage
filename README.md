@@ -17,8 +17,9 @@ the LLM client through a service that derives department routing and human revie
 TASK-007 adds bounded retries for transient provider failures and safe HTTP error
 responses. TASK-008 adds request logging and correlation IDs. TASK-009 completes
 the automated behavioral test suite, including provider and logging failure paths.
-TASK-010 adds the labelled evaluation dataset. The evaluation runner, model
-evaluation, Docker, and CI are scheduled for later tasks.
+TASK-010 adds the labelled evaluation dataset. TASK-011 adds an explicitly invoked
+evaluation runner and offline tests of its scoring. Model evaluation and prompt
+refinement, Docker, and CI are scheduled for later tasks.
 
 See [the project plan](docs/PROJECT_PLAN.md) for the specification and roadmap,
 and [AGENTS.md](AGENTS.md) for development guidelines.
@@ -329,7 +330,59 @@ not an estimate of real support traffic or independently human-adjudicated groun
 All rows were validated as JSON, checked against `TicketRequest` and the category
 and priority enums, and checked for duplicate IDs and ticket texts. No provider
 calls or model evaluation have been run for this dataset, so no accuracy or other
-evaluation metrics are reported. The evaluation script belongs to TASK-011.
+evaluation metrics are reported.
+
+## Running evaluation
+
+From the repository root, after configuring `.env`, explicitly run:
+
+```powershell
+.\.venv\Scripts\python.exe -m evaluation.evaluate
+```
+
+This sends the dataset's tickets through `app.service.triage_ticket`, including
+the real LLM client, its timeout/retry policy, and deterministic business rules.
+Requests run sequentially and consume provider usage. No API server is needed.
+The default dataset is resolved relative to the evaluation module; use
+`--dataset path/to/tickets.jsonl` to select another labelled dataset.
+
+To validate the dataset without credentials or provider access:
+
+```powershell
+.\.venv\Scripts\python.exe -m evaluation.evaluate --validate-only
+```
+
+On macOS/Linux, replace the executable with `.venv/bin/python`. `--help` lists
+the options. Importing the module and running normal `pytest` do not invoke a
+live evaluation. Tests of the runner mock the LLM client or service and verify
+scoring against hand-calculated fixtures; they are not model performance results.
+
+The entire dataset is checked before provider calls. Invalid rows report their
+line number; empty or unreadable datasets and invalid settings stop the run.
+Reference labels, IDs, notes, and tags are excluded from classification input.
+During evaluation, provider, schema, and unexpected per-ticket failures are
+recorded without stopping subsequent tickets. The report lists failed ticket
+numbers and exception types, excluding raw ticket text and exception messages.
+
+Metric definitions:
+
+- Category and priority accuracy divide correct predictions by all attempted
+  tickets, including failures.
+- Priority macro F1 averages F1 across all four priority enums. Missing predictions
+  count as false negatives. A class with no actual or predicted examples has F1 0.
+- Critical recall divides correctly predicted critical tickets by all labelled
+  critical tickets, including failed ones. It is `N/A` if none are labelled critical.
+- Schema success rate is valid final `TriageResponse` results divided by attempted
+  tickets, after any client retry. Provider failures also reduce this rate; it is
+  not a measurement of individual generation attempts.
+- Average, p50, and p95 latency include successful and failed service calls,
+  validation, retries, and retry delays, measured with a monotonic clock in seconds.
+  Percentiles use linear interpolation at `(n - 1) * percentile` in sorted samples.
+
+The command prints a summary and exits with 0 when every ticket returns a valid
+response, 1 when any ticket fails, or 2 for dataset/configuration errors.
+Misclassifications affect scores but are not execution failures. Validation-only
+mode exits with 0 for valid data and prints no model metrics.
 
 ## Repository structure
 
@@ -349,6 +402,7 @@ tests/
     conftest.py
     test_api.py
     test_config.py
+    test_evaluation.py
     test_llm_client.py
     test_prompt.py
     test_request_logging.py
@@ -356,6 +410,7 @@ tests/
     test_service.py
 evaluation/
     eval_tickets.jsonl
+    evaluate.py
 docs/
     PROJECT_PLAN.md
 AGENTS.md
