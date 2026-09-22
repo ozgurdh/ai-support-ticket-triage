@@ -9,8 +9,10 @@ TASK-001 initializes the repository: Python packaging, dependencies, development
 tools, an importable `app` package, and an environment-variable template.
 TASK-002 adds domain enums and validated request, classification, and response
 schemas with automated tests. TASK-003 adds the health and triage endpoints with
-a deterministic mock response and Swagger documentation. LLM integration,
-business rules, evaluation, Docker, and CI are scheduled for later tasks.
+a deterministic mock response and Swagger documentation. TASK-004 adds the prompt
+builder, taxonomy descriptions, priority rubric, and input trust instructions.
+LLM integration, business rules, evaluation, Docker, and CI are scheduled for
+later tasks.
 
 See [the project plan](docs/PROJECT_PLAN.md) for the specification and roadmap,
 and [AGENTS.md](AGENTS.md) for development guidelines.
@@ -121,8 +123,10 @@ On macOS / Linux, use `.venv/bin/python` instead.
 
 Schema tests cover field requirements, length boundaries, enum values, invalid
 input, and JSON serialization. API tests cover health, mock triage responses,
-request and response validation, Swagger, and OpenAPI. Tests run without API keys
-or real LLM calls.
+request and response validation, Swagger, and OpenAPI. Prompt tests cover taxonomy
+and rubric coverage, output instructions, ticket formatting, and separation of
+ticket content from system instructions. Tests run without API keys or real LLM
+calls; they do not measure model accuracy or resistance to prompt injection.
 
 ## Domain models and validation
 
@@ -142,6 +146,22 @@ Unknown fields and invalid enum values are rejected. Department routing and
 human-review decisions will be implemented in the service task; these schemas
 only validate the supplied fields.
 
+## Prompt builder
+
+`app/prompt.py` contains `SYSTEM_PROMPT`, `format_ticket(ticket)`, and
+`build_messages(ticket)`. The builder returns separate system and user messages.
+The user message contains JSON-encoded subject and description; the ticket ID is
+excluded because it is not needed for classification.
+
+The system prompt describes all category and priority enum values using the
+project plan's definitions. It requests only the four classification fields,
+requires factual summaries and a safe initial action, and instructs the model to
+treat ticket text as untrusted data and ignore embedded instructions.
+
+The prompt builder is not connected to the API yet. The triage endpoint continues
+to return its temporary mock response. Provider calls and structured-output
+integration belong to TASK-005.
+
 ## Repository structure
 
 ```text
@@ -149,10 +169,12 @@ app/
     __init__.py
     enums.py
     main.py
+    prompt.py
     schemas.py
 tests/
     .gitkeep
     test_api.py
+    test_prompt.py
     test_schemas.py
 docs/
     PROJECT_PLAN.md
