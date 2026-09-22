@@ -1,0 +1,2 @@
+# Install the project and development tools from pyproject.toml.
+-e .[dev]
