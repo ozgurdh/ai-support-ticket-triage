@@ -17,7 +17,8 @@ the LLM client through a service that derives department routing and human revie
 TASK-007 adds bounded retries for transient provider failures and safe HTTP error
 responses. TASK-008 adds request logging and correlation IDs. TASK-009 completes
 the automated behavioral test suite, including provider and logging failure paths.
-Evaluation, Docker, and CI are scheduled for later tasks.
+TASK-010 adds the labelled evaluation dataset. The evaluation runner, model
+evaluation, Docker, and CI are scheduled for later tasks.
 
 See [the project plan](docs/PROJECT_PLAN.md) for the specification and roadmap,
 and [AGENTS.md](AGENTS.md) for development guidelines.
@@ -289,6 +290,47 @@ before any provider request. Provider error handling and retry policy stay in
 `llm_client.py`; HTTP error mapping stays in `main.py`. Routing and human-review
 decisions remain in the service.
 
+## Evaluation dataset
+
+[`evaluation/eval_tickets.jsonl`](evaluation/eval_tickets.jsonl) contains 50
+synthetic support tickets with individually assigned reference labels and a
+per-ticket rationale checked against the existing taxonomy and priority rubric.
+These examples are authored fixtures, not real customer tickets or model predictions.
+
+Each UTF-8 JSONL row contains `subject`, `description`, `expected_category`, and
+`expected_priority`, plus a unique `id`, `scenario_types` (a list of tags), and
+`notes` explaining the labels. Only subject and description are classification
+input; expected labels, tags, and notes are reference metadata.
+
+| Category | Low | Medium | High | Critical | Total |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `access_authentication` | 2 | 2 | 4 | 1 | 9 |
+| `software_application` | 3 | 3 | 2 | 1 | 9 |
+| `hardware_device` | 2 | 3 | 2 | 1 | 8 |
+| `network_connectivity` | 2 | 2 | 2 | 2 | 8 |
+| `security_incident` | 1 | 1 | 2 | 4 | 8 |
+| `other` | 4 | 2 | 1 | 1 | 8 |
+| **Total** | **14** | **13** | **13** | **10** | **50** |
+
+Overlapping edge-case tags identify 7 ambiguous cases, 5 multi-issue tickets,
+5 short tickets, 6 prompt-injection attempts, 10 critical incidents, 6 company-wide
+incidents, and 2 irrelevant requests. Short descriptions still meet the API's
+10-character minimum. Injection cases include subject role claims, embedded JSON,
+code blocks, XML delimiters, severity inflation, and attempted severity suppression.
+
+Multi-issue labels follow the explicitly stated primary issue. Ambiguous examples
+retain uncertainty instead of guessing a root cause; stated impact determines
+priority. The detail-free help request is labelled low with a clarification rationale.
+Security examples span all priorities so security classification alone does not
+imply critical impact. Category counts are nearly balanced; critical cases are
+deliberately included across categories. This is a coverage-oriented starter set,
+not an estimate of real support traffic or independently human-adjudicated ground truth.
+
+All rows were validated as JSON, checked against `TicketRequest` and the category
+and priority enums, and checked for duplicate IDs and ticket texts. No provider
+calls or model evaluation have been run for this dataset, so no accuracy or other
+evaluation metrics are reported. The evaluation script belongs to TASK-011.
+
 ## Repository structure
 
 ```text
@@ -312,6 +354,8 @@ tests/
     test_request_logging.py
     test_schemas.py
     test_service.py
+evaluation/
+    eval_tickets.jsonl
 docs/
     PROJECT_PLAN.md
 AGENTS.md
