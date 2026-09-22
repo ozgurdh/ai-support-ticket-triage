@@ -7,8 +7,9 @@ validated triage results using an LLM and deterministic business rules.
 
 TASK-001 initializes the repository: Python packaging, dependencies, development
 tools, an importable `app` package, and an environment-variable template.
-Domain models, API endpoints, LLM integration, evaluation, Docker, and CI are
-scheduled for later tasks and are not implemented yet.
+TASK-002 adds domain enums and validated request, classification, and response
+schemas with automated tests. API endpoints, LLM integration, evaluation, Docker,
+and CI are scheduled for later tasks and are not implemented yet.
 
 See [the project plan](docs/PROJECT_PLAN.md) for the specification and roadmap,
 and [AGENTS.md](AGENTS.md) for development guidelines.
@@ -71,17 +72,37 @@ Using the virtual environment's Python (Windows commands shown):
 
 On macOS / Linux, use `.venv/bin/python` instead.
 
-The `tests/` directory is reserved for future behavioral tests. At TASK-001,
-pytest reports no tests collected (exit code 5). Schema tests start in TASK-002.
-Normal automated tests must run without real LLM calls.
+Schema tests cover field requirements, length boundaries, enum values, invalid
+input, and JSON serialization. They run without API keys or real LLM calls.
+
+## Domain models and validation
+
+`app/enums.py` defines the planned category, priority, and department values.
+`app/schemas.py` provides three separate Pydantic models:
+
+- `TicketRequest`: optional `ticket_id` (up to 100 characters, default `None`),
+  required `subject` (1–200 characters), and `description` (10–5000 characters).
+- `LLMClassificationResult`: required `category`, `priority`, `summary`, and
+  `suggested_action`. It contains only classification fields.
+- `TriageResponse`: classification fields plus a required, nullable `ticket_id`
+  (up to 100 characters), `department`, and `needs_human_review`.
+
+Surrounding whitespace is stripped from text fields before length validation.
+Summary and suggested action must contain at least one non-whitespace character.
+Unknown fields and invalid enum values are rejected. Department routing and
+human-review decisions will be implemented in the service task; these schemas
+only validate the supplied fields.
 
 ## Repository structure
 
 ```text
 app/
     __init__.py
+    enums.py
+    schemas.py
 tests/
     .gitkeep
+    test_schemas.py
 docs/
     PROJECT_PLAN.md
 AGENTS.md
