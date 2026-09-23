@@ -480,7 +480,6 @@ app/
     schemas.py
     service.py
 tests/
-    .gitkeep
     conftest.py
     test_api.py
     test_config.py
