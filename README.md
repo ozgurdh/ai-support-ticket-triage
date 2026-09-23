@@ -19,7 +19,8 @@ responses. TASK-008 adds request logging and correlation IDs. TASK-009 completes
 the automated behavioral test suite, including provider and logging failure paths.
 TASK-010 adds the labelled evaluation dataset. TASK-011 adds an explicitly invoked
 evaluation runner and offline tests of its scoring. Model evaluation and prompt
-refinement and CI are scheduled for later tasks. TASK-013 adds a Docker image.
+refinement are scheduled for later tasks. TASK-013 adds a Docker image, and
+TASK-014 adds GitHub Actions CI.
 
 See [the project plan](docs/PROJECT_PLAN.md) for the specification and roadmap,
 and [AGENTS.md](AGENTS.md) for development guidelines.
@@ -178,6 +179,10 @@ Using the virtual environment's Python (Windows commands shown):
 ```
 
 On macOS / Linux, use `.venv/bin/python` instead.
+
+GitHub Actions runs Ruff and pytest on pushes and pull requests using Python
+3.11. It installs from `requirements.txt`, needs no OpenAI API key, and does not
+run the live evaluation pipeline.
 
 Schema tests cover field requirements, length boundaries, enum values, invalid
 input, and JSON serialization. Service tests cover all category/priority combinations,
@@ -441,5 +446,5 @@ requirements.txt
 ## Planned documentation
 
 API usage, architecture, taxonomy, routing and human-review rules, structured
-outputs, reliability, evaluation results, and CI will be documented
+outputs, reliability, and evaluation results will be documented
 as their corresponding tasks are implemented.
