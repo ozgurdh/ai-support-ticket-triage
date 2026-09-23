@@ -19,7 +19,7 @@ responses. TASK-008 adds request logging and correlation IDs. TASK-009 completes
 the automated behavioral test suite, including provider and logging failure paths.
 TASK-010 adds the labelled evaluation dataset. TASK-011 adds an explicitly invoked
 evaluation runner and offline tests of its scoring. Model evaluation and prompt
-refinement, Docker, and CI are scheduled for later tasks.
+refinement and CI are scheduled for later tasks. TASK-013 adds a Docker image.
 
 See [the project plan](docs/PROJECT_PLAN.md) for the specification and roadmap,
 and [AGENTS.md](AGENTS.md) for development guidelines.
@@ -66,6 +66,20 @@ from the repository root:
 On macOS / Linux, use `.venv/bin/python -m uvicorn app.main:app --reload`.
 Open [Swagger UI](http://localhost:8000/docs) to try the endpoints. The OpenAPI
 schema is available at [openapi.json](http://localhost:8000/openapi.json).
+
+## Docker
+
+Build and run the API from the repository root:
+
+```powershell
+docker build -t ticket-triage-api .
+docker run --rm -p 8000:8000 --env-file .env ticket-triage-api
+```
+
+The container listens on port 8000. Open `http://localhost:8000/health` to
+check it. The `.env` file is supplied only when the container starts; it is
+excluded from the image. Omit `--env-file .env` when checking `/health` without
+provider credentials. Triage requests require the configured key and model.
 
 ## API usage
 
@@ -427,5 +441,5 @@ requirements.txt
 ## Planned documentation
 
 API usage, architecture, taxonomy, routing and human-review rules, structured
-outputs, reliability, evaluation results, Docker usage, and CI will be documented
+outputs, reliability, evaluation results, and CI will be documented
 as their corresponding tasks are implemented.
