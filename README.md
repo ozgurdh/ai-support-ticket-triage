@@ -3,37 +3,43 @@
 A FastAPI service for converting unstructured IT support tickets into
 validated triage results using an LLM and deterministic business rules.
 
-## Current status
-
-TASK-001 initializes the repository: Python packaging, dependencies, development
-tools, an importable `app` package, and an environment-variable template.
-TASK-002 adds domain enums and validated request, classification, and response
-schemas with automated tests. TASK-003 adds the health and triage endpoints with
-a deterministic mock response and Swagger documentation. TASK-004 adds the prompt
-builder, taxonomy descriptions, priority rubric, and input trust instructions.
-TASK-005 adds a standalone OpenAI client with structured classification, validated
-environment settings, and timeout/error foundations. TASK-006 connects the API to
-the LLM client through a service that derives department routing and human review.
-TASK-007 adds bounded retries for transient provider failures and safe HTTP error
-responses. TASK-008 adds request logging and correlation IDs. TASK-009 completes
-the automated behavioral test suite, including provider and logging failure paths.
-TASK-010 adds the labelled evaluation dataset. TASK-011 adds an explicitly invoked
-evaluation runner and offline tests of its scoring. Model evaluation and prompt
-refinement are scheduled for later tasks. TASK-013 adds a Docker image, and
-TASK-014 adds GitHub Actions CI.
+The API validates an incoming ticket, uses an OpenAI model to classify its issue
+and urgency, then derives department routing and human review with deterministic
+Python rules. It returns a stable Pydantic response and exposes a separate health
+endpoint. The project includes mocked tests, a labelled evaluation dataset,
+Docker packaging, and CI. It does not persist tickets or provide a user interface.
 
 See [the project plan](docs/PROJECT_PLAN.md) for the specification and roadmap,
 and [AGENTS.md](AGENTS.md) for development guidelines.
 
-## Foundation stack
+## Tech stack
 
 - Python 3.11+
 - FastAPI, Uvicorn, Pydantic, and pydantic-settings
 - OpenAI Python SDK and Tenacity
 - pytest, httpx, and Ruff for development
+- Docker and GitHub Actions for packaging and CI
 
 Dependencies are declared in `pyproject.toml`. `requirements.txt` installs the
 project in editable mode with its development tools.
+
+## Architecture
+
+```text
+POST /api/v1/triage
+    → FastAPI request validation (app/main.py, app/schemas.py)
+    → triage service (app/service.py)
+    → prompt builder (app/prompt.py) + OpenAI client (app/llm_client.py)
+    → validated category, priority, summary, suggested_action
+    → deterministic department and human-review rules (app/service.py)
+    → TriageResponse
+```
+
+The model handles natural-language classification. The service owns routing and
+review rules, so the model cannot assign a department independently. Settings
+live in `app/config.py`; request metadata logging lives in
+`app/request_logging.py`. Unit tests use provider mocks, while
+`evaluation/evaluate.py` calls the real pipeline only when explicitly run.
 
 ## Setup
 
@@ -87,7 +93,7 @@ provider credentials. Triage requests require the configured key and model.
 `GET /health` returns HTTP 200 with `{"status": "ok"}` without calling the provider.
 
 `POST /api/v1/triage` validates a JSON ticket, calls the configured LLM, and applies
-deterministic routing and review rules. It returns HTTP 200 on success. This now
+deterministic routing and review rules. It returns HTTP 200 on success. This
 makes a real provider request and requires `OPENAI_API_KEY` and `OPENAI_MODEL`.
 For example, submit this body through Swagger UI:
 
@@ -180,9 +186,7 @@ Using the virtual environment's Python (Windows commands shown):
 
 On macOS / Linux, use `.venv/bin/python` instead.
 
-GitHub Actions runs Ruff and pytest on pushes and pull requests using Python
-3.11. It installs from `requirements.txt`, needs no OpenAI API key, and does not
-run the live evaluation pipeline.
+## Testing
 
 Schema tests cover field requirements, length boundaries, enum values, invalid
 input, and JSON serialization. Service tests cover all category/priority combinations,
@@ -191,7 +195,8 @@ the LLM client. API tests exercise routing, human review, request and response
 validation, safe error responses, health, Swagger, and OpenAPI. Prompt tests cover taxonomy
 and rubric coverage, output instructions, ticket formatting, and separation of
 ticket content from system instructions. Tests run without API keys or real LLM
-calls; they do not measure model accuracy or resistance to prompt injection.
+calls, keeping them deterministic and independent of provider usage; they do not
+measure model accuracy or resistance to prompt injection.
 Settings tests isolate environment and dotenv values. LLM client tests exercise
 the SDK against an in-memory HTTP mock, including structured-output validation,
 timeouts, provider errors, refusals, and incomplete responses. Retry tests cover
@@ -213,9 +218,16 @@ An omitted provider mock therefore fails the test before an outbound HTTP reques
 can be sent. FastAPI's in-process test transport and SDK `MockTransport` remain
 available. Tests use dummy credentials and require no real OpenAI access.
 
+## GitHub Actions CI
+
+The workflow in `.github/workflows/ci.yml` runs on pushes and pull requests
+with Python 3.11. It installs from `requirements.txt`, then runs `ruff check .`
+and `pytest`. Provider calls are mocked in tests, so CI needs no OpenAI API key
+and does not run the live evaluation pipeline.
+
 ## Domain models and validation
 
-`app/enums.py` defines the planned category, priority, and department values.
+`app/enums.py` defines the supported category, priority, and department values.
 `app/schemas.py` provides three separate Pydantic models:
 
 - `TicketRequest`: optional `ticket_id` (up to 100 characters, default `None`),
@@ -229,6 +241,32 @@ Surrounding whitespace is stripped from text fields before length validation.
 Summary and suggested action must contain at least one non-whitespace character.
 Unknown fields and invalid enum values are rejected. Schemas validate supplied
 fields; the service derives department routing and human-review decisions.
+
+## Ticket taxonomy and priority
+
+The classifier chooses exactly one category and one priority. Categories are:
+
+| Category | Typical issues |
+| --- | --- |
+| `access_authentication` | Login, password, MFA, account lockout, and access permission problems |
+| `software_application` | Application crashes, errors, configuration, and installation issues |
+| `hardware_device` | Laptop, monitor, printer, and workstation device failures |
+| `network_connectivity` | Wi-Fi, DNS, disconnections, and network performance problems |
+| `security_incident` | Suspicious login, phishing, malware, stolen credentials, and suspected breaches |
+| `other` | Issues that cannot reasonably fit another category |
+
+Priority follows the stated impact, not the ticket's requested label:
+
+| Priority | Rubric |
+| --- | --- |
+| `low` | Questions, how-to requests, minor configuration, installations, or low-impact inconvenience |
+| `medium` | Degraded or intermittent service, a workaround, or moderate productivity impact |
+| `high` | A user unable to work, required VPN or authentication unavailable, or significant disruption short of company-wide impact |
+| `critical` | Major suspected breach, ransomware, high-risk active compromise, company-wide outage, or critical shared infrastructure unavailable |
+
+The prompt asks for factual summaries, preserves uncertainty, and treats ticket
+text as untrusted data. Embedded requests to override classification or reveal
+instructions have no authority.
 
 ## Triage service
 
@@ -264,14 +302,19 @@ treat ticket text as untrusted data and ignore embedded instructions.
 
 The LLM client uses this builder when called by the triage service.
 
-## LLM client
+## Structured outputs and LLM client
 
 `app.llm_client.classify_ticket(ticket, settings=None)` accepts a validated
 `TicketRequest` and returns `LLMClassificationResult`. It uses the OpenAI
 Responses API's `responses.parse` method with the existing Pydantic schema,
 following the [Structured Outputs guide](https://developers.openai.com/api/docs/guides/structured-outputs).
-The SDK dependency now requires version 2.54 or later within major version 2,
+The SDK dependency requires version 2.54 or later within major version 2,
 the baseline tested for this integration.
+
+Structured output constrains the model to `category`, `priority`, `summary`,
+and `suggested_action`; Pydantic rejects unsupported enum values, missing fields,
+and extra fields. The application does not parse free-form model JSON or ask the
+model to produce `department` or `needs_human_review`.
 
 The following explicitly invokes the real provider after configuring `.env`:
 
@@ -347,9 +390,7 @@ deliberately included across categories. This is a coverage-oriented starter set
 not an estimate of real support traffic or independently human-adjudicated ground truth.
 
 All rows were validated as JSON, checked against `TicketRequest` and the category
-and priority enums, and checked for duplicate IDs and ticket texts. No provider
-calls or model evaluation have been run for this dataset, so no accuracy or other
-evaluation metrics are reported.
+and priority enums, and checked for duplicate IDs and ticket texts.
 
 ## Running evaluation
 
@@ -406,6 +447,25 @@ response, 1 when any ticket fails, or 2 for dataset/configuration errors.
 Misclassifications affect scores but are not execution failures. Validation-only
 mode exits with 0 for valid data and prints no model metrics.
 
+## Recorded evaluation results
+
+One real evaluation run produced these results:
+
+| Metric | Result |
+| --- | ---: |
+| Category accuracy | 100.00% |
+| Priority accuracy | 96.00% |
+| Priority macro F1 | 96.25% |
+| Critical recall | 100.00% |
+| Schema success rate | 100.00% |
+| Average latency | 2.482 s |
+| P50 latency | 2.274 s |
+| P95 latency | 3.613 s |
+
+These figures describe this authored evaluation set and this run, not guaranteed
+performance on future support tickets. The model identifier and run settings were
+not recorded with the figures; a later run may differ.
+
 ## Repository structure
 
 ```text
@@ -431,20 +491,29 @@ tests/
     test_schemas.py
     test_service.py
 evaluation/
+    __init__.py
     eval_tickets.jsonl
     evaluate.py
+.github/workflows/
+    ci.yml
 docs/
     PROJECT_PLAN.md
 AGENTS.md
 README.md
+Dockerfile
+.dockerignore
 pyproject.toml
 requirements.txt
 .env.example
 .gitignore
 ```
 
-## Planned documentation
+## Future improvements
 
-API usage, architecture, taxonomy, routing and human-review rules, structured
-outputs, reliability, and evaluation results will be documented
-as their corresponding tasks are implemented.
+- Evaluate on a larger set of independently reviewed tickets and inspect errors
+  before changing the prompt or taxonomy.
+- Compare supported models on the same labelled set, including latency and cost.
+- Record model, prompt revision, and run metadata alongside future evaluation
+  results to make comparisons reproducible.
+- Consider a separately triggered evaluation workflow; normal CI should remain
+  offline and credential-free.
