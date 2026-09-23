@@ -24,6 +24,11 @@ from app.schemas import LLMClassificationResult, TicketRequest
 class LLMClientError(Exception):
     """The provider could not complete the classification request."""
 
+    def __init__(self, message: str, *, diagnostic: str | None = None) -> None:
+        super().__init__(message)
+        # Evaluation may display this provider metadata; API responses remain generic.
+        self.diagnostic = diagnostic
+
 
 class LLMTimeoutError(LLMClientError):
     """The provider request timed out."""
@@ -35,6 +40,36 @@ class LLMResponseError(LLMClientError):
 
 class _RecoverableResponseError(LLMResponseError):
     """A fresh generation may recover from malformed or missing model output."""
+
+
+def _status_diagnostic(error: APIStatusError) -> str:
+    """Describe SDK status and known codes without copying provider response text."""
+    known_codes = {
+        "credit_balance_exhausted",
+        "insufficient_quota",
+        "organization_spend_limit_exceeded",
+        "project_spend_limit_exceeded",
+        "organization_usage_limit_exceeded",
+        "invalid_api_key",
+        "rate_limit_exceeded",
+    }
+    code = error.code if isinstance(error.code, str) else None
+    parts = [f"HTTP {error.status_code}"]
+    if code in known_codes:
+        parts.append(f"code={code}")
+    if error.type == "insufficient_quota":
+        parts.append("type=insufficient_quota")
+    if code == "credit_balance_exhausted":
+        message = "Provider credit balance exhausted."
+    elif code == "invalid_api_key":
+        message = "Provider credentials are invalid."
+    elif code in known_codes or error.type == "insufficient_quota":
+        message = "Provider quota or spend limit reached."
+    elif error.status_code == 429:
+        message = "Provider rate limit reached."
+    else:
+        message = "Provider request failed."
+    return f"{type(error).__name__} ({'; '.join(parts)}): {message}"
 
 
 def _is_retryable(error: BaseException) -> bool:
@@ -129,12 +164,26 @@ def classify_ticket(
         # Keep local validation outside the retry operation.
         return LLMClassificationResult.model_validate(classification)
     except APITimeoutError:
-        raise LLMTimeoutError("Provider request timed out.") from None
+        raise LLMTimeoutError(
+            "Provider request timed out.",
+            diagnostic="APITimeoutError: Provider request timed out.",
+        ) from None
     except APIResponseValidationError:
-        raise LLMResponseError("Provider returned an invalid classification.") from None
+        raise LLMResponseError(
+            "Provider returned an invalid classification.",
+            diagnostic="APIResponseValidationError: Provider response was invalid.",
+        ) from None
     except APIStatusError as error:
         if error.status_code in (408, 504):
-            raise LLMTimeoutError("Provider request timed out.") from None
-        raise LLMClientError("Provider request failed.") from None
-    except APIError:
-        raise LLMClientError("Provider request failed.") from None
+            raise LLMTimeoutError(
+                "Provider request timed out.",
+                diagnostic=_status_diagnostic(error),
+            ) from None
+        raise LLMClientError(
+            "Provider request failed.", diagnostic=_status_diagnostic(error)
+        ) from None
+    except APIError as error:
+        raise LLMClientError(
+            "Provider request failed.",
+            diagnostic=f"{type(error).__name__}: Provider request failed.",
+        ) from None

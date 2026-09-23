@@ -336,6 +336,51 @@ def test_quota_failure_is_not_retried(
     retry_sleep.assert_not_called()
 
 
+def test_quota_diagnostic_uses_safe_status_and_code(provider: Mock) -> None:
+    provider.return_value = httpx.Response(
+        429,
+        json={
+            "error": {
+                "message": "Private billing details and secret-token",
+                "code": "credit_balance_exhausted",
+                "type": "insufficient_quota",
+            }
+        },
+    )
+
+    with pytest.raises(llm_client.LLMClientError) as raised:
+        llm_client.classify_ticket(TICKET)
+
+    assert str(raised.value) == "Provider request failed."
+    assert raised.value.diagnostic == (
+        "RateLimitError (HTTP 429; code=credit_balance_exhausted; "
+        "type=insufficient_quota): Provider credit balance exhausted."
+    )
+    assert "secret-token" not in raised.value.diagnostic
+    provider.assert_called_once()
+
+
+def test_provider_diagnostic_omits_unrecognized_provider_fields(provider: Mock) -> None:
+    provider.return_value = httpx.Response(
+        400,
+        json={
+            "error": {
+                "message": "private-ticket-text",
+                "code": "private-token",
+                "type": "private-context",
+            }
+        },
+    )
+
+    with pytest.raises(llm_client.LLMClientError) as raised:
+        llm_client.classify_ticket(TICKET)
+
+    assert raised.value.diagnostic == (
+        "BadRequestError (HTTP 400): Provider request failed."
+    )
+    assert "private" not in raised.value.diagnostic
+
+
 @pytest.mark.parametrize(
     "headers",
     [{"retry-after": "60"}, {"retry-after-ms": "60000"}, {"x-should-retry": "false"}],

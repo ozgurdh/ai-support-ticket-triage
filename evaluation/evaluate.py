@@ -14,6 +14,7 @@ from pydantic import ConfigDict, ValidationError
 from app import service
 from app.config import Settings
 from app.enums import TicketCategory, TicketPriority
+from app.llm_client import LLMClientError
 from app.schemas import TicketRequest, TriageResponse
 
 DEFAULT_DATASET = Path(__file__).with_name("eval_tickets.jsonl")
@@ -34,6 +35,7 @@ class EvaluationResult:
     response: TriageResponse | None
     latency_seconds: float
     error_type: str | None = None
+    error_detail: str | None = None
 
 
 def load_dataset(path: Path) -> list[DatasetTicket]:
@@ -60,6 +62,7 @@ def run_evaluation(tickets: Sequence[DatasetTicket]) -> list[EvaluationResult]:
     for example in tickets:
         response = None
         error_type = None
+        error_detail = None
         started = perf_counter()
         try:
             # Reference labels, notes, tags, and dataset IDs never reach the model.
@@ -71,6 +74,8 @@ def run_evaluation(tickets: Sequence[DatasetTicket]) -> list[EvaluationResult]:
             # Continue after provider, validation, or unexpected per-ticket failures.
             # KeyboardInterrupt/SystemExit still interrupt the run normally.
             error_type = type(error).__name__
+            if isinstance(error, LLMClientError):
+                error_detail = error.diagnostic
         results.append(
             EvaluationResult(
                 expected_category=example.expected_category,
@@ -78,6 +83,7 @@ def run_evaluation(tickets: Sequence[DatasetTicket]) -> list[EvaluationResult]:
                 response=response,
                 latency_seconds=perf_counter() - started,
                 error_type=error_type,
+                error_detail=error_detail,
             )
         )
     return results
@@ -170,7 +176,8 @@ def print_report(results: Sequence[EvaluationResult]) -> None:
         print("\nFailures (ticket number in dataset order):")
         for index, result in enumerate(results, 1):
             if result.error_type:
-                print(f"  Ticket {index}: {result.error_type}")
+                detail = f" — {result.error_detail}" if result.error_detail else ""
+                print(f"  Ticket {index}: {result.error_type}{detail}")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -185,11 +192,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="JSONL dataset (defaults to evaluation/eval_tickets.jsonl)",
     )
     parser.add_argument(
+        "--limit",
+        type=int,
+        metavar="N",
+        help="Evaluate only the first N tickets (must be positive)",
+    )
+    parser.add_argument(
         "--validate-only",
         action="store_true",
         help="Validate dataset rows without credentials or provider calls",
     )
     args = parser.parse_args(argv)
+    if args.limit is not None and args.limit < 1:
+        parser.error("--limit must be a positive integer")
     try:
         tickets = load_dataset(args.dataset)
     except (OSError, UnicodeError, ValueError) as error:
@@ -208,7 +223,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
-    results = run_evaluation(tickets)
+    results = run_evaluation(tickets[: args.limit])
     print_report(results)
     return 1 if any(result.error_type is not None for result in results) else 0
 

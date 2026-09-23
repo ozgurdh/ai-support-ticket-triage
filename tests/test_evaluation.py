@@ -192,7 +192,13 @@ def test_failures_do_not_stop_later_tickets_or_expose_messages(
 ) -> None:
     classifier.side_effect = [
         llm_client.LLMTimeoutError("private-timeout"),
-        llm_client.LLMClientError("private-api-key"),
+        llm_client.LLMClientError(
+            "private-api-key",
+            diagnostic=(
+                "RateLimitError (HTTP 429; code=credit_balance_exhausted; "
+                "type=insufficient_quota): Provider credit balance exhausted."
+            ),
+        ),
         llm_client.LLMResponseError("private-output"),
         RuntimeError("private-description"),
         classification(),
@@ -213,6 +219,11 @@ def test_failures_do_not_stop_later_tickets_or_expose_messages(
     assert "Schema success rate: 20.00%" in output
     assert "Critical recall: N/A" in output
     assert "Ticket 4: RuntimeError" in output
+    assert (
+        "Ticket 2: LLMClientError — RateLimitError (HTTP 429; "
+        "code=credit_balance_exhausted; type=insufficient_quota): "
+        "Provider credit balance exhausted."
+    ) in output
     assert "private-" not in output
 
 
@@ -290,6 +301,38 @@ def test_cli_reports_results_and_exit_status(
         "P95 latency:",
     ):
         assert label in output
+
+
+@pytest.mark.parametrize("limit,expected", [(1, 1), (2, 2), (5, 3)])
+def test_cli_limit_evaluates_first_tickets_only(
+    tmp_path: Path,
+    classifier: Mock,
+    capsys: pytest.CaptureFixture[str],
+    limit: int,
+    expected: int,
+) -> None:
+    rows = [{**ROW, "subject": f"Ticket {index}"} for index in range(1, 4)]
+    path = write_dataset(tmp_path, rows)
+
+    assert evaluate.main(["--dataset", str(path), "--limit", str(limit)]) == 0
+
+    assert classifier.call_args_list == [
+        call(TicketRequest(subject=row["subject"], description=row["description"]))
+        for row in rows[:expected]
+    ]
+    assert f"Tickets evaluated: {expected}" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("limit", ["0", "-1", "abc"])
+def test_cli_limit_rejects_non_positive_or_non_integer_values(
+    classifier: Mock, capsys: pytest.CaptureFixture[str], limit: str
+) -> None:
+    with pytest.raises(SystemExit) as raised:
+        evaluate.main(["--limit", limit])
+
+    assert raised.value.code == 2
+    assert "--limit" in capsys.readouterr().err
+    classifier.assert_not_called()
 
 
 def test_invalid_configuration_exits_before_calls(

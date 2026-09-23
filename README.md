@@ -345,6 +345,7 @@ the real LLM client, its timeout/retry policy, and deterministic business rules.
 Requests run sequentially and consume provider usage. No API server is needed.
 The default dataset is resolved relative to the evaluation module; use
 `--dataset path/to/tickets.jsonl` to select another labelled dataset.
+Use `--limit N` to evaluate only the first N tickets (N must be positive).
 
 To validate the dataset without credentials or provider access:
 
@@ -362,7 +363,9 @@ line number; empty or unreadable datasets and invalid settings stop the run.
 Reference labels, IDs, notes, and tags are excluded from classification input.
 During evaluation, provider, schema, and unexpected per-ticket failures are
 recorded without stopping subsequent tickets. The report lists failed ticket
-numbers and exception types, excluding raw ticket text and exception messages.
+numbers and exception types. Provider failures also show safe SDK type, HTTP
+status, recognized error code/type, and a fixed explanation. Raw ticket text,
+provider response messages, and secrets are excluded.
 
 Metric definitions:
 
